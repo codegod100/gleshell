@@ -1,0 +1,11 @@
+*.beam
+*.ez
+/build
+erl_crash.dump
+
+# Nix / devenv
+/result
+/result-*
+/.devenv
+/.direnv
+/devenv.local.nix
