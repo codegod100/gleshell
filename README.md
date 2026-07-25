@@ -31,6 +31,20 @@ nix run . -- -c 'ls | first 3'
 gleam run
 ```
 
+### REPL editing
+
+The interactive REPL uses Erlang’s line editor (`edlin`):
+
+| Key | Action |
+|-----|--------|
+| ↑ / ↓ or Ctrl+P / Ctrl+N | History |
+| **Ctrl+R** | Reverse-i-search through history |
+| Ctrl+A / Ctrl+E | Beginning / end of line |
+| Ctrl+W | Delete previous word |
+| Ctrl+C / Ctrl+G | Cancel search / interrupt |
+
+History is persisted under the user cache as `gleshell-history` (OTP `shell_history`).
+
 ## Examples
 
 ```nu
@@ -43,8 +57,9 @@ range 5 | length
 
 # records and JSON
 echo {name: "gleshell", cool: true}
-echo "{\"a\": 1}" | from-json | get a
+echo "{\"a\": 1}" | from json | get a
 open data.json | get users | first
+range 3 | to json
 
 # variables
 let n = range 3 | length
@@ -77,7 +92,7 @@ Filesystem: `ls`, `cd`, `pwd`, `cat`, `open`, `save`
 
 Table/list: `where`/`filter`, `select`, `get`, `first`, `last`, `take`, `skip`, `sort-by`, `reverse`, `length`, `columns`, `table`, `flatten`, `uniq`, `wrap`, `unwrap`, `keys`, `values`
 
-Data: `echo`, `range`, `lines`, `to-json`, `from-json`, `type`, `describe`, `env`, `sys`, `which`, `help`, `exit`
+Data: `echo`, `range`, `lines`, `to json`, `from json`, `type`, `describe`, `env`, `sys`, `which`, `help`, `exit`
 
 Unknown command names fall through to external executables on `PATH`.
 
@@ -86,15 +101,19 @@ Unknown command names fall through to external executables on `PATH`.
 ```text
 src/
   gleshell.gleam          # entry + REPL
-  gleshell_ffi.erl        # readline, cwd, process spawn
+  gleshell_ffi.erl        # line editor (Ctrl+R), cwd, process spawn
   gleshell/
     value.gleam           # structured Value type
     lexer.gleam / parser.gleam
     eval.gleam            # pipeline evaluator
     builtins.gleam        # Nu-inspired commands
     display.gleam         # table pretty-printer
+    color.gleam           # Nushell-style ANSI colors
     env.gleam / sys.gleam
 ```
+
+Output is colorized on a TTY (headers bold green, numbers purple, bools cyan,
+dirs blue, errors red, …). Disable with `NO_COLOR=1`; force with `FORCE_COLOR=1`.
 
 ## Status
 

@@ -1,4 +1,7 @@
+import gleam/string
 import gleeunit
+import gleshell/color
+import gleshell/display
 import gleshell/env
 import gleshell/eval
 import gleshell/lexer
@@ -131,8 +134,31 @@ pub fn eval_where_select_test() {
 pub fn eval_from_json_test() {
   let env = env.new()
   let assert eval.Continue(_, Record(fields)) =
-    eval.eval_source(env, "echo \"{\\\"x\\\": 1}\" | from-json")
+    eval.eval_source(env, "echo \"{\\\"x\\\": 1}\" | from json")
   let assert True = list_has_field(fields, "x", Int(1))
+  Nil
+}
+
+pub fn eval_to_json_pretty_test() {
+  let env = env.new()
+  // Nushell-style multi-word `to json` — pretty by default
+  let assert eval.Continue(_, String(pretty)) =
+    eval.eval_source(env, "echo [1 2 3] | to json")
+  let assert True = string.contains(pretty, "\n")
+  let assert True = string.contains(pretty, "1")
+  // `--raw` matches Nu: compact, no trailing newline
+  let assert eval.Continue(_, String(raw)) =
+    eval.eval_source(env, "echo [1 2 3] | to json --raw")
+  let assert "[1,2,3]" = raw
+  Nil
+}
+
+pub fn eval_to_json_record_test() {
+  let env = env.new()
+  let assert eval.Continue(_, String(raw)) =
+    eval.eval_source(env, "echo {a: 1, b: true} | to json -r")
+  let assert True = string.contains(raw, "\"a\":1")
+  let assert True = string.contains(raw, "\"b\":true")
   Nil
 }
 
@@ -162,4 +188,47 @@ pub fn value_nothing_falsey_test() {
   let assert False = value.is_truthy(Nothing)
   let assert True = value.is_truthy(Int(1))
   Nil
+}
+
+// --- display / color ---
+
+pub fn display_plain_no_ansi_test() {
+  let text = display.render_with(False, Bool(True))
+  let assert "true" = text
+  let assert False = string_contains(text, "\u{001b}")
+  Nil
+}
+
+pub fn display_colored_has_ansi_test() {
+  let text = display.render_with(True, Bool(True))
+  let assert True = string_contains(text, "\u{001b}")
+  let assert True = string_contains(text, "true")
+  Nil
+}
+
+pub fn display_table_headers_colored_test() {
+  let text =
+    display.render_with(
+      True,
+      Table(["name", "type"], [[String("src"), String("dir")]]),
+    )
+  // bold green header + bright-blue dir name
+  let assert True = string_contains(text, "\u{001b}[1;32m")
+  let assert True = string_contains(text, "\u{001b}[94m")
+  let assert True = string_contains(text, "src")
+  Nil
+}
+
+pub fn color_visible_length_strips_ansi_test() {
+  let painted = color.paint(True, "\u{001b}[32m", "hi")
+  let assert 2 = color.visible_length(painted)
+  let assert 2 = color.visible_length("hi")
+  Nil
+}
+
+fn string_contains(haystack: String, needle: String) -> Bool {
+  case string.split(haystack, needle) {
+    [_] -> False
+    _ -> True
+  }
 }

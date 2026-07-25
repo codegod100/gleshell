@@ -3,6 +3,11 @@
 @external(erlang, "gleshell_ffi", "get_line")
 pub fn get_line(prompt: String) -> Result(String, String)
 
+/// Run `body` as the OTP interactive shell process so the REPL gets
+/// edlin line editing: history (up/down) and Ctrl+R reverse-i-search.
+@external(erlang, "gleshell_ffi", "run_as_shell")
+pub fn run_as_shell(body: fn() -> Nil) -> Nil
+
 @external(erlang, "gleshell_ffi", "set_cwd")
 pub fn set_cwd(path: String) -> Result(Nil, String)
 
@@ -26,3 +31,6 @@ pub fn which(command: String) -> Result(String, Nil)
 
 @external(erlang, "gleshell_ffi", "home_dir")
 pub fn home_dir() -> Result(String, String)
+
+@external(erlang, "gleshell_ffi", "stdout_isatty")
+pub fn stdout_isatty() -> Bool

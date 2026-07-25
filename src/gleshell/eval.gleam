@@ -72,9 +72,9 @@ fn eval_command(env: Env, cmd: Command, input: Value) -> EvalResult {
           case external {
             True -> run_external(env, name, pos)
             False ->
-              case dict.get(builtins.registry(), name) {
-                Ok(builtin) ->
-                  case builtin(env, input, pos, flags) {
+              case resolve_builtin(name, pos) {
+                Ok(#(builtin, pos2)) ->
+                  case builtin(env, input, pos2, flags) {
                     builtins.Exit(code) -> Quit(code)
                     builtins.BuiltinResult(env2, value) -> {
                       let env2 = case value {
@@ -90,6 +90,26 @@ fn eval_command(env: Env, cmd: Command, input: Value) -> EvalResult {
         }
       }
     }
+  }
+}
+
+/// Look up a builtin, including Nushell-style multi-word names (`to json`).
+/// When `name` alone is missing, try consuming a following bare string arg.
+fn resolve_builtin(
+  name: String,
+  pos: List(Value),
+) -> Result(#(builtins.Builtin, List(Value)), Nil) {
+  case dict.get(builtins.registry(), name) {
+    Ok(builtin) -> Ok(#(builtin, pos))
+    Error(Nil) ->
+      case pos {
+        [String(sub), ..rest] ->
+          case dict.get(builtins.registry(), name <> " " <> sub) {
+            Ok(builtin) -> Ok(#(builtin, rest))
+            Error(Nil) -> Error(Nil)
+          }
+        _ -> Error(Nil)
+      }
   }
 }
 

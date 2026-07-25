@@ -52,10 +52,9 @@ pub fn registry() -> dict.Dict(String, Builtin) {
     #("uniq", cmd_uniq),
     #("wrap", cmd_wrap),
     #("unwrap", cmd_unwrap),
-    #("to-json", cmd_to_json),
-    #("to_json", cmd_to_json),
-    #("from-json", cmd_from_json),
-    #("from_json", cmd_from_json),
+    // Nushell multi-word: `to json` / `from json`
+    #("to json", cmd_to_json),
+    #("from json", cmd_from_json),
     #("lines", cmd_lines),
     #("typeof", cmd_type),
     #("type", cmd_type),
@@ -151,8 +150,14 @@ fn help_text() -> dict.Dict(String, String) {
     #("take", "take <n> — take first n rows"),
     #("skip", "skip <n> — skip first n rows"),
     #("echo", "echo <values>… — emit values (list if multiple)"),
-    #("to-json", "to-json — convert input to JSON string"),
-    #("from-json", "from-json — parse JSON string input"),
+    #(
+      "to json",
+      "to json [--raw|-r] [--indent|-i n] — convert input to JSON string (pretty by default)",
+    ),
+    #(
+      "from json",
+      "from json — parse JSON string input into structured data",
+    ),
     #("range", "range <end> | range <start> <end> — integer range list"),
     #("sys", "sys — host info record"),
   ])
@@ -709,15 +714,35 @@ fn cmd_unwrap(
   }
 }
 
-// --- json ---
+// --- json (mirrors Nushell `to json` / `from json`) ---
 
 fn cmd_to_json(
   env: Env,
   input: Value,
   _args: List(Value),
-  _flags: dict.Dict(String, Value),
+  flags: dict.Dict(String, Value),
 ) -> BuiltinResult {
-  ok(env, String(value_to_json_string(input)))
+  // Default: pretty-print with 2-space indent (like Nu). `--raw` / `-r` is compact.
+  let raw = flag_set(flags, "raw") || flag_set(flags, "r")
+  let indent = case raw {
+    True -> option.None
+    False ->
+      case flag_int(flags, "indent") {
+        option.Some(n) -> option.Some(n)
+        option.None ->
+          case flag_int(flags, "i") {
+            option.Some(n) -> option.Some(n)
+            option.None -> option.Some(2)
+          }
+      }
+  }
+  let body = encode_json(input, indent, 0)
+  // Nu's default includes a trailing newline; `--raw` omits it.
+  let text = case indent {
+    option.None -> body
+    option.Some(_) -> body <> "\n"
+  }
+  ok(env, String(text))
 }
 
 fn cmd_from_json(
@@ -736,16 +761,34 @@ fn cmd_from_json(
     _ -> ""
   }
   case source {
-    "" -> err(env, "from-json: empty input")
+    "" -> err(env, "from json: empty input")
     s ->
       case parse_json_value(s) {
         Ok(v) -> ok(env, v)
-        Error(msg) -> err(env, "from-json: " <> msg)
+        Error(msg) -> err(env, "from json: " <> msg)
       }
   }
 }
 
-fn value_to_json_string(v: Value) -> String {
+fn flag_set(flags: dict.Dict(String, Value), name: String) -> Bool {
+  case dict.get(flags, name) {
+    Ok(Bool(False)) -> False
+    Ok(Nothing) -> False
+    Ok(_) -> True
+    Error(Nil) -> False
+  }
+}
+
+fn flag_int(flags: dict.Dict(String, Value), name: String) -> option.Option(Int) {
+  case dict.get(flags, name) {
+    Ok(Int(n)) -> option.Some(n)
+    _ -> option.None
+  }
+}
+
+/// Encode a value as JSON. `indent` is `None` for compact (`--raw`), or
+/// `Some(n)` for n-space pretty-print (Nushell default is 2).
+fn encode_json(v: Value, indent: option.Option(Int), depth: Int) -> String {
   case v {
     Nothing -> "null"
     Bool(True) -> "true"
@@ -753,23 +796,79 @@ fn value_to_json_string(v: Value) -> String {
     Int(n) -> int.to_string(n)
     Float(f) -> float.to_string(f)
     String(s) -> json_escape(s)
-    List(items) ->
-      "[" <> string.join(list.map(items, value_to_json_string), ",") <> "]"
-    Record(fields) ->
-      "{"
-      <> string.join(
-        list.map(fields, fn(pair) {
-          let #(k, val) = pair
-          json_escape(k) <> ":" <> value_to_json_string(val)
-        }),
-        ",",
-      )
-      <> "}"
+    List(items) -> encode_json_array(items, indent, depth)
+    Record(fields) -> encode_json_object(fields, indent, depth)
     Table(cols, rows) -> {
       let records = list.map(rows, fn(row) { Record(list.zip(cols, row)) })
-      value_to_json_string(List(records))
+      encode_json(List(records), indent, depth)
     }
     Fail(msg) -> json_escape("error: " <> msg)
+  }
+}
+
+fn encode_json_array(
+  items: List(Value),
+  indent: option.Option(Int),
+  depth: Int,
+) -> String {
+  case items {
+    [] -> "[]"
+    _ ->
+      case indent {
+        option.None ->
+          "["
+          <> string.join(list.map(items, fn(i) { encode_json(i, indent, 0) }), ",")
+          <> "]"
+        option.Some(width) -> {
+          let inner = depth + 1
+          let pad = string.repeat(" ", width * inner)
+          let close = string.repeat(" ", width * depth)
+          let body =
+            items
+            |> list.map(fn(i) { pad <> encode_json(i, indent, inner) })
+            |> string.join(",\n")
+          "[\n" <> body <> "\n" <> close <> "]"
+        }
+      }
+  }
+}
+
+fn encode_json_object(
+  fields: List(#(String, Value)),
+  indent: option.Option(Int),
+  depth: Int,
+) -> String {
+  case fields {
+    [] -> "{}"
+    _ ->
+      case indent {
+        option.None ->
+          "{"
+          <> string.join(
+            list.map(fields, fn(pair) {
+              let #(k, val) = pair
+              json_escape(k) <> ":" <> encode_json(val, indent, 0)
+            }),
+            ",",
+          )
+          <> "}"
+        option.Some(width) -> {
+          let inner = depth + 1
+          let pad = string.repeat(" ", width * inner)
+          let close = string.repeat(" ", width * depth)
+          let body =
+            fields
+            |> list.map(fn(pair) {
+              let #(k, val) = pair
+              pad
+              <> json_escape(k)
+              <> ": "
+              <> encode_json(val, indent, inner)
+            })
+            |> string.join(",\n")
+          "{\n" <> body <> "\n" <> close <> "}"
+        }
+      }
   }
 }
 

@@ -3,6 +3,7 @@
 import argv
 import gleam/io
 import gleam/string
+import gleshell/color
 import gleshell/display
 import gleshell/env
 import gleshell/eval
@@ -20,7 +21,7 @@ pub fn main() -> Nil {
       io.println_error("gleshell: -c requires a command string")
       halt(2)
     }
-    [] -> repl(env.new())
+    [] -> sys.run_as_shell(fn() { repl(env.new()) })
     args -> run_once(string.join(args, " "))
   }
 }
@@ -62,7 +63,7 @@ fn run_once(code: String) -> Nil {
 
 fn repl(env: env.Env) -> Nil {
   io.println(
-    "gleshell 0.1 — structured data shell (type `help`, `exit` to quit)",
+    "gleshell 0.1 — structured data shell (type `help`, `exit` to quit; Ctrl+R reverse search)",
   )
   repl_loop(env)
 }
@@ -102,7 +103,11 @@ fn repl_loop(env: env.Env) -> Nil {
 
 fn prompt_for(env: env.Env) -> String {
   let base = basename(env.cwd)
-  "gleshell:" <> base <> "> "
+  let on = color.enabled()
+  color.prompt_name(on, "gleshell")
+  <> color.separator(on, ":")
+  <> color.prompt_path(on, base)
+  <> color.prompt_mark(on, "> ")
 }
 
 fn basename(path: String) -> String {
