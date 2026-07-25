@@ -8,6 +8,7 @@ import gleshell/env
 import gleshell/eval
 import gleshell/highlight
 import gleshell/lexer
+import gleshell/pager
 import gleshell/parser
 import gleshell/sys
 import gleshell/value.{Bool, Int, List, Nothing, Record, String, Table}
@@ -50,6 +51,44 @@ pub fn lexer_path_idents_test() {
     lexer.Ident("~/code"),
     lexer.Eof,
   ] = tokens
+  Nil
+}
+
+pub fn lexer_bare_double_dash_test() {
+  // POSIX end-of-options: `nix run . -- args` must not lex-error on bare `--`.
+  let assert Ok(tokens) = lexer.tokenize("nix run . -- chadfowler.com yolo")
+  let assert [
+    lexer.Ident("nix"),
+    lexer.Ident("run"),
+    lexer.Ident("."),
+    lexer.Flag(""),
+    lexer.Ident("chadfowler.com"),
+    lexer.Ident("yolo"),
+    lexer.Eof,
+  ] = tokens
+  // Named long flags still work
+  let assert Ok(tokens2) = lexer.tokenize("cmd --think --scale 3")
+  let assert [
+    lexer.Ident("cmd"),
+    lexer.Flag("think"),
+    lexer.Flag("scale"),
+    lexer.IntLit(3),
+    lexer.Eof,
+  ] = tokens2
+  Nil
+}
+
+pub fn parse_bare_double_dash_test() {
+  let assert Ok(parser.Expr(parser.Pipeline([
+    parser.Command("nix", args, False),
+  ]))) = parser.parse("nix run . -- chadfowler.com yolo")
+  let assert [
+    parser.ValueArg(parser.Lit(String("run"))),
+    parser.ValueArg(parser.Lit(String("."))),
+    parser.ValueArg(parser.Lit(String("--"))),
+    parser.ValueArg(parser.Lit(String("chadfowler.com"))),
+    parser.ValueArg(parser.Lit(String("yolo"))),
+  ] = args
   Nil
 }
 
@@ -228,6 +267,20 @@ pub fn eval_where_select_test() {
     )
   let assert Table(["name"], rows) = result
   let assert [[String("b")], [String("c")]] = rows
+  Nil
+}
+
+pub fn about_command_test() {
+  let env = env.new()
+  let assert eval.Continue(_, String(text)) = eval.eval_source(env, "about")
+  let assert True = string.contains(text, "gleshell")
+  let assert True = string.contains(text, "nandi.uk")
+  let assert True = string.contains(text, "NaNdi")
+  let assert True = string.contains(text, "did:plc:ngokl2gnmpbvuvrfckja3g7p")
+  let assert True = string.contains(text, "latha.org")
+  let assert eval.Continue(_, String(which_out)) =
+    eval.eval_source(env, "which about")
+  let assert "builtin: about" = which_out
   Nil
 }
 
@@ -498,6 +551,129 @@ pub fn color_visible_length_strips_ansi_test() {
   let assert 2 = color.visible_length(painted)
   let assert 2 = color.visible_length("hi")
   Nil
+}
+
+// --- less / pager ---
+
+pub fn pager_wrap_respects_ansi_width_test() {
+  // 10 visible chars of content; wrap at 4 → three physical lines.
+  let painted = color.paint(True, "\u{001b}[32m", "abcdefghij")
+  let lines = pager.wrap_line(painted, 4)
+  let assert 3 = list.length(lines)
+  // Each physical line still carries / continues color; visible width ≤ 4.
+  list.each(lines, fn(line) {
+    let assert True = color.visible_length(line) <= 4
+  })
+  // Joining without separators reconstructs the original SGR + text.
+  let joined = string.join(lines, "")
+  let assert True = string.contains(joined, "abcdefghij")
+  let assert True = string.contains(joined, "\u{001b}[32m")
+  Nil
+}
+
+pub fn pager_display_lines_splits_newlines_test() {
+  let lines = pager.display_lines("a\nb\nc", 80)
+  let assert ["a", "b", "c"] = lines
+  Nil
+}
+
+pub fn less_short_output_passthrough_test() {
+  // Non-TTY test runner: needs_paging is false → less returns the text.
+  let env = env.new()
+  let assert eval.Continue(_, String(out)) =
+    eval.eval_source(env, "echo hello | less")
+  let assert True = string.contains(out, "hello")
+  let assert eval.Continue(_, String(which_out)) =
+    eval.eval_source(env, "which less")
+  let assert "builtin: less" = which_out
+  Nil
+}
+
+pub fn less_preserves_ansi_in_string_test() {
+  let env = env.new()
+  // Pre-colored multi-line text must survive less (no re-paint / strip).
+  let colored = "\u{001b}[31mred\u{001b}[0m\n\u{001b}[32mgreen\u{001b}[0m"
+  let assert eval.Continue(_, String(out)) =
+    eval.eval_source(env, "echo \"" <> escape_for_source(colored) <> "\" | less")
+  let assert True = string.contains(out, "\u{001b}[31m")
+  let assert True = string.contains(out, "red")
+  let assert True = string.contains(out, "\u{001b}[32m")
+  let assert True = string.contains(out, "green")
+  Nil
+}
+
+pub fn less_no_input_errors_test() {
+  let env = env.new()
+  let assert eval.Continue(env2, value.Fail(msg)) = eval.eval_source(env, "less")
+  let assert True = string.contains(msg, "no input")
+  let assert 1 = env2.last_exit
+  Nil
+}
+
+pub fn less_help_test() {
+  let env = env.new()
+  let assert eval.Continue(_, String(help_out)) =
+    eval.eval_source(env, "help less")
+  let assert True = string.contains(help_out, "ANSI")
+  let assert True = string.contains(help_out, "q")
+  Nil
+}
+
+pub fn pipeline_capture_forces_git_tty_config_test() {
+  // git ignores FORCE_COLOR and hides decorations on pipes; child_env injects
+  // color.ui=always + log.decorate=short. FORCE_COLOR makes want_child_color
+  // true without a TTY. Use `let` so capture mode does not leak printenv.
+  let prev = sys.getenv("FORCE_COLOR")
+  let assert Ok(_) = sys.setenv("FORCE_COLOR", "1")
+  let env = env.new()
+  let color = eval.eval_source(env, "let x = ^printenv GIT_CONFIG_VALUE_0")
+  let decorate = eval.eval_source(env, "let y = ^printenv GIT_CONFIG_VALUE_1")
+  case prev {
+    Ok(v) -> {
+      let assert Ok(_) = sys.setenv("FORCE_COLOR", v)
+      Nil
+    }
+    Error(Nil) -> {
+      let assert Ok(_) = sys.setenv("FORCE_COLOR", "")
+      Nil
+    }
+  }
+  let assert eval.Continue(_, String(color_out)) = color
+  let assert eval.Continue(_, String(decorate_out)) = decorate
+  let assert True = string.contains(color_out, "always")
+  let assert True = string.contains(decorate_out, "short")
+  Nil
+}
+
+pub fn git_log_pipeline_emits_ansi_and_decorate_test() {
+  let prev = sys.getenv("FORCE_COLOR")
+  let assert Ok(_) = sys.setenv("FORCE_COLOR", "1")
+  let env = env.new()
+  // Full log (not --oneline): decorations appear on the commit line.
+  let result = eval.eval_source(env, "git log -1 | identity")
+  case prev {
+    Ok(v) -> {
+      let assert Ok(_) = sys.setenv("FORCE_COLOR", v)
+      Nil
+    }
+    Error(Nil) -> {
+      let assert Ok(_) = sys.setenv("FORCE_COLOR", "")
+      Nil
+    }
+  }
+  let assert eval.Continue(_, String(out)) = result
+  // Real git colors, not gleshell string-green on plain text.
+  let assert True = string.contains(out, "\u{001b}[")
+  // decorate=short: ref names like HEAD / main (auto would omit on a pipe).
+  let assert True = string.contains(out, "HEAD") || string.contains(out, "main")
+  Nil
+}
+
+/// Embed a string in double-quoted source: escape `\` and `"`.
+fn escape_for_source(s: String) -> String {
+  s
+  |> string.replace("\\", "\\\\")
+  |> string.replace("\"", "\\\"")
 }
 
 // --- input syntax highlighting ---

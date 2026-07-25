@@ -18,6 +18,10 @@
     home_dir/0,
     stdout_isatty/0,
     println/1,
+    write/1,
+    term_size/0,
+    read_key_name/0,
+    with_key_mode/1,
     take_output_shown/0,
     clear_output_shown/0,
     complete_word/2,
@@ -43,6 +47,143 @@ println(Text) when is_binary(Text) ->
             io:put_chars([Text, $\n]),
             nil
     end.
+
+%% Write text without an automatic trailing newline. ANSI sequences are passed
+%% through unchanged. In raw TTY mode, bare LFs become CRLF so lines do not
+%% staircase (same as println/1).
+-spec write(binary()) -> nil.
+write(Text) when is_binary(Text) ->
+    case get(gleshell_raw) of
+        true ->
+            io:put_chars(to_crlf(Text)),
+            nil;
+        _ ->
+            io:put_chars(Text),
+            nil
+    end.
+
+%% Terminal size when stdout is a TTY. Defaults to 24×80 if the driver omits a
+%% dimension. Error when stdout is not a terminal (pager should dump instead).
+-spec term_size() -> {ok, {integer(), integer()}} | {error, nil}.
+term_size() ->
+    case stdout_isatty() of
+        false ->
+            {error, nil};
+        true ->
+            Rows =
+                case io:rows() of
+                    {ok, R} when is_integer(R), R > 0 ->
+                        R;
+                    _ ->
+                        24
+                end,
+            Cols =
+                case io:columns() of
+                    {ok, C} when is_integer(C), C > 0 ->
+                        C;
+                    _ ->
+                        80
+                end,
+            {ok, {Rows, Cols}}
+    end.
+
+%% Run Fun with the TTY in single-key (non-canonical, no-echo) mode when the
+%% REPL is not already raw. Restores termios afterwards. Prefer wrapping a
+%% whole pager session rather than each keystroke.
+-spec with_key_mode(fun(() -> term())) -> term().
+with_key_mode(Fun) when is_function(Fun, 0) ->
+    case get(gleshell_raw) of
+        true ->
+            Fun();
+        _ ->
+            case stdout_isatty() of
+                false ->
+                    Fun();
+                true ->
+                    case stty_save() of
+                        {ok, Saved} ->
+                            _ = stty_run(["-icanon", "-echo", "min", "1", "time", "0"]),
+                            try
+                                Fun()
+                            after
+                                stty_restore(Saved)
+                            end;
+                        _ ->
+                            Fun()
+                    end
+            end
+    end.
+
+%% Blocking single-key read for the builtin pager. Returns a short name:
+%% "up" | "down" | "left" | "right" | "home" | "end" | "page_up" | "page_down"
+%% | "enter" | "backspace" | "tab" | "ctrl_c" | "ctrl_l" | "space" | "eof"
+%% | single printable grapheme ("q", "j", "G", …) | "other".
+%%
+%% Call inside `with_key_mode/1` when not already in the raw REPL, so cooked
+%% TTYs (e.g. `gleshell -c '… | less'`) still deliver keys one at a time.
+-spec read_key_name() -> {ok, binary()} | {error, binary()}.
+read_key_name() ->
+    try
+        {ok, key_to_name(read_key())}
+    catch
+        _:Reason ->
+            {error, reason_to_bin(Reason)}
+    end.
+
+key_to_name(eof) ->
+    <<"eof">>;
+key_to_name(enter) ->
+    <<"enter">>;
+key_to_name(tab) ->
+    <<"tab">>;
+key_to_name(backspace) ->
+    <<"backspace">>;
+key_to_name(delete) ->
+    <<"delete">>;
+key_to_name(up) ->
+    <<"up">>;
+key_to_name(down) ->
+    <<"down">>;
+key_to_name(left) ->
+    <<"left">>;
+key_to_name(right) ->
+    <<"right">>;
+key_to_name(home) ->
+    <<"home">>;
+key_to_name('end') ->
+    <<"end">>;
+key_to_name(page_up) ->
+    <<"page_up">>;
+key_to_name(page_down) ->
+    <<"page_down">>;
+key_to_name(ctrl_c) ->
+    <<"ctrl_c">>;
+key_to_name(ctrl_l) ->
+    <<"ctrl_l">>;
+key_to_name(ctrl_a) ->
+    <<"ctrl_a">>;
+key_to_name(ctrl_e) ->
+    <<"ctrl_e">>;
+key_to_name(ctrl_d) ->
+    <<"ctrl_d">>;
+key_to_name(ctrl_k) ->
+    <<"ctrl_k">>;
+key_to_name(ctrl_u) ->
+    <<"ctrl_u">>;
+key_to_name(ctrl_w) ->
+    <<"ctrl_w">>;
+key_to_name(ctrl_r) ->
+    <<"ctrl_r">>;
+key_to_name(ctrl_g) ->
+    <<"ctrl_g">>;
+key_to_name({char, 32}) ->
+    <<"space">>;
+key_to_name({char, C}) when is_integer(C), C >= 32 ->
+    unicode:characters_to_binary([C]);
+key_to_name({error, _}) ->
+    <<"eof">>;
+key_to_name(_) ->
+    <<"other">>.
 
 %% Normalize newlines to CRLF without turning existing \r\n into \r\r\n.
 to_crlf(Bin) when is_binary(Bin) ->
@@ -555,13 +696,13 @@ to_charlist(L) when is_list(L) ->
 
 fallback_builtin_names() ->
     [
-        "append", "cat", "cd", "columns", "count", "describe", "echo", "env",
-        "exit", "filter", "find", "first", "flatten", "from", "get", "help",
-        "identity", "ignore", "is-empty", "is_empty", "keys", "last", "length",
-        "lines", "ls", "open", "prepend", "print", "pwd", "quit", "range",
-        "reverse", "save", "select", "skip", "sort-by", "sort_by", "sys",
-        "table", "take", "to", "type", "typeof", "uniq", "unwrap",
-        "values", "where", "which", "wrap"
+        "about", "append", "cat", "cd", "columns", "count", "describe", "echo",
+        "env", "exit", "filter", "find", "first", "flatten", "from", "get",
+        "help", "identity", "ignore", "is-empty", "is_empty", "keys", "last",
+        "length", "less", "lines", "ls", "open", "prepend", "print", "pwd",
+        "quit", "range", "reverse", "save", "select", "skip", "sort-by",
+        "sort_by", "sys", "table", "take", "to", "type", "typeof", "uniq",
+        "unwrap", "values", "where", "which", "wrap"
     ].
 
 %% Executable basenames on PATH that match Prefix (deduped, sorted).
@@ -1023,6 +1164,8 @@ read_csi_params(Acc) ->
                 "1" -> home;
                 "3" -> delete;
                 "4" -> 'end';
+                "5" -> page_up;
+                "6" -> page_down;
                 "7" -> home;
                 "8" -> 'end';
                 _ -> other
@@ -2096,9 +2239,12 @@ normalize_pty_output(Bin) when is_binary(Bin) ->
 %% - SHELL=/bin/sh: `script` invokes $SHELL; nu/fish break `script -c`.
 %% - LESS=FRX when unset: pagers (jj/git → less) pass through ANSI colors (-R)
 %%   and exit on short output (-F) without clearing the screen (-X).
-%% - FORCE_COLOR / CLICOLOR_FORCE when the shell itself wants color and the
-%%   child has no TTY (direct path): tools like jj/git/ripgrep emit ANSI so
-%%   we can show their colors when re-printing the captured string.
+%% - When the shell wants color and the child has no TTY (pipeline capture):
+%%   FORCE_COLOR / CLICOLOR_FORCE for tools that honor them (jj, many CLIs),
+%%   and git GIT_CONFIG_* overlays (git ignores FORCE_COLOR and treats pipes as
+%%   non-terminals): color.ui=always so `git log | less` is colored, and
+%%   log.decorate=short because decorate=auto drops ref names
+%%   (`(HEAD, origin/main, …)`) when stdout is not a TTY.
 child_env() ->
     Env0 = [{"SHELL", "/bin/sh"}],
     Env1 =
@@ -2114,23 +2260,47 @@ child_env() ->
         false ->
             Env1;
         true ->
-            Env2 =
-                case os:getenv("FORCE_COLOR") of
-                    false ->
-                        [{"FORCE_COLOR", "1"} | Env1];
-                    "0" ->
-                        Env1;
-                    _ ->
-                        Env1
-                end,
-            case os:getenv("CLICOLOR_FORCE") of
-                false ->
-                    [{"CLICOLOR_FORCE", "1"} | Env2];
-                "0" ->
-                    Env2;
-                _ ->
-                    Env2
-            end
+            force_git_tty_env(force_color_env(Env1))
+    end.
+
+%% FORCE_COLOR / CLICOLOR_FORCE for children that honor them.
+force_color_env(Env) ->
+    Env1 =
+        case os:getenv("FORCE_COLOR") of
+            false ->
+                [{"FORCE_COLOR", "1"} | Env];
+            "0" ->
+                Env;
+            _ ->
+                Env
+        end,
+    case os:getenv("CLICOLOR_FORCE") of
+        false ->
+            [{"CLICOLOR_FORCE", "1"} | Env1];
+        "0" ->
+            Env1;
+        _ ->
+            Env1
+    end.
+
+%% Make git behave like a TTY for captured pipelines (git ≥ 2.31 GIT_CONFIG_*).
+%% Skipped when the caller already set GIT_CONFIG_COUNT so we do not clobber.
+%%
+%% - color.ui=always: git ignores FORCE_COLOR
+%% - log.decorate=short: default auto hides decorations on non-TTY stdout
+force_git_tty_env(Env) ->
+    case os:getenv("GIT_CONFIG_COUNT") of
+        false ->
+            [
+                {"GIT_CONFIG_COUNT", "2"},
+                {"GIT_CONFIG_KEY_0", "color.ui"},
+                {"GIT_CONFIG_VALUE_0", "always"},
+                {"GIT_CONFIG_KEY_1", "log.decorate"},
+                {"GIT_CONFIG_VALUE_1", "short"}
+                | Env
+            ];
+        _ ->
+            Env
     end.
 
 %% Match gleshell color policy: off under NO_COLOR; otherwise on for a TTY

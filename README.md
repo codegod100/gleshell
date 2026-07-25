@@ -6,7 +6,7 @@ Instead of piping opaque text between programs, gleshell pipelines pass typed va
 
 ```text
 ~/code/gleshell on  main
-❯ ls | where type == file | select name size | first 5
+ ❯ ls | where type == file | select name size | first 5
 ╭──────┬──────╮
 │ name │ size │
 ├──────┼──────┤
@@ -15,8 +15,11 @@ Instead of piping opaque text between programs, gleshell pipelines pass typed va
 ```
 
 The interactive prompt is zero-config and Starship-inspired: full path with `~`,
-optional git branch (read from `.git`, no external tools), and a `❯` character
-that turns red after a non-zero exit.
+optional git branch (read from `.git`, no external tools), and a Nerd Font shell
+icon (``) before the `❯` character (which turns red after a non-zero exit).
+Install a Nerd Font so the glyphs render (flake: `nix profile install
+.#nerd-fonts`, or put `nerd-fonts.symbols-only` in your system/fonts packages;
+the devenv shell already includes it).
 
 ## Quick start
 
@@ -31,12 +34,29 @@ gle -c 'ls | first 3'
 nix run . -- -c 'ls | first 3'
 
 # dev shell (source tree; gleam, erlang, rebar3)
-# --no-pure-eval lets devenv use the real project dir (not /nix/store)
+# Preferred: direnv auto-loads the flake shell (see .envrc). Once:
+#   direnv allow
+# then cd into the repo (nushell needs a direnv pre_prompt hook; see below).
+# Manual alternative — bare `nix develop` fails under pure flake eval:
 nix develop --no-pure-eval
 gleam run                 # interactive REPL
 gleam run -- -c 'ls | first 3'
 gleam test
 ```
+
+### direnv
+
+This repo ships a [`.envrc`](.envrc) that runs `use flake . --no-pure-eval`
+so devenv can see the real project directory (pure flake eval cannot).
+
+1. Install [direnv](https://direnv.net/) and hook it into your shell
+   ([nushell](https://github.com/direnv/direnv/wiki/Nushell), bash, zsh, …).
+2. From the repo root: `direnv allow`
+3. Open a new shell (or `cd .`) — you should see the devenv enter message and
+   have `gleam` on `PATH` without running `nix develop`.
+
+Bare `nix develop` still needs `--no-pure-eval` for the same reason; with
+direnv you usually do not need `nix develop` at all.
 
 ### REPL editing
 
@@ -116,7 +136,11 @@ Filesystem: `ls`, `cd`, `pwd`, `cat`, `open`, `save`
 
 Table/list: `where`/`filter`, `find`, `select`, `get`, `first`, `last`, `take`, `skip`, `sort-by`, `reverse`, `length`, `columns`, `table`, `flatten`, `uniq`, `wrap`, `unwrap`, `keys`, `values`
 
-Data: `echo`, `range`, `lines`, `to`/`from` (subcommand `json`), `type`, `describe`, `env`, `sys`, `which`, `help`, `exit`
+Data: `echo`, `range`, `lines`, `to`/`from` (subcommand `json`), `type`, `describe`, `env`, `sys`, `which`, `help`, `about`, `exit`
+
+Pager: `less` — builtin color-aware pager for pipeline input or files (`ls | less`,
+`less README.md`). ANSI from tables and external tools is kept; short output is
+printed without an interactive session. `^less` still runs the external binary.
 
 Unknown command names fall through to external executables on `PATH`.
 
@@ -131,6 +155,7 @@ src/
     lexer.gleam / parser.gleam
     eval.gleam            # pipeline evaluator
     builtins.gleam        # Nu-inspired commands
+    pager.gleam           # color-aware builtin less
     display.gleam         # table pretty-printer
     color.gleam           # Nushell-style ANSI colors
     highlight.gleam       # live input syntax highlighting
@@ -140,11 +165,15 @@ src/
 Input and output are colorized on a TTY (Nu-like shapes on the command line;
 headers bold green, numbers purple, bools cyan, dirs blue, errors red, …).
 External tools (`jj`, `git`, `fastfetch`, …) keep their own colors: final-stage
-commands inherit the real TTY (or get `FORCE_COLOR` when output is captured), and
-pre-colored text is not re-painted by the shell. While the raw line editor is
-active, the TTY is switched to cooked mode for those children so LF-only
-output does not staircase. Paginated output gets `LESS=FRX` when unset so
-`less` passes ANSI through.
+commands inherit the real TTY; captured pipeline stages get `FORCE_COLOR` /
+`CLICOLOR_FORCE`, and git gets `color.ui=always` plus `log.decorate=short` via
+`GIT_CONFIG_*` (git ignores `FORCE_COLOR`, and `decorate=auto` drops
+`(HEAD, origin/main, …)` when stdout is a pipe — so bare `git log | less`
+would otherwise lose both color and ref decorations). Pre-colored text is not
+re-painted by the shell. While the raw line editor is active, the TTY is
+switched to cooked mode for those children so LF-only output does not
+staircase. The builtin `less` keeps ANSI (like `less -R`); external pagers
+still get `LESS=FRX` when unset so they pass colors through.
 Disable with `NO_COLOR=1`; force with `FORCE_COLOR=1`.
 
 ## Status

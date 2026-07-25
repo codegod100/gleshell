@@ -235,6 +235,9 @@ fn parse_args(
 ) -> Result(#(List(Arg), List(Token)), ParseError) {
   case tokens {
     [] | [Eof] | [Pipe, ..] -> Ok(#(list.reverse(acc), tokens))
+    // Bare `--` (lexer Flag("")) → literal argv element, not a named flag.
+    [Flag(""), ..rest] ->
+      parse_args(rest, [ValueArg(Lit(value.String("--"))), ..acc])
     [Flag(name), ..rest] -> {
       case is_expr_start(rest) {
         True -> {

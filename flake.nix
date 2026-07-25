@@ -136,10 +136,15 @@
               license = lib.licenses.asl20;
             };
           };
+
+          # Prompt icons (``, ``, …). Install so the REPL glyph set renders:
+          #   nix profile install .#nerd-fonts
+          # On NixOS/home-manager prefer fonts.packages instead.
+          nerd-fonts = pkgs.nerd-fonts.symbols-only;
         in
         {
           default = gleshell;
-          inherit gleshell;
+          inherit gleshell nerd-fonts;
         }
       );
 

@@ -5,6 +5,8 @@
     gleam
     beamPackages.erlang
     rebar3
+    # Icons for the REPL prompt (``, ``, …). Symbols-only is small.
+    nerd-fonts.symbols-only
   ];
 
   enterShell = ''

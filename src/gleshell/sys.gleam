@@ -8,6 +8,24 @@ pub fn get_line(prompt: String) -> Result(String, String)
 @external(erlang, "gleshell_ffi", "println")
 pub fn println(text: String) -> Nil
 
+/// Write text with no automatic trailing newline. ANSI is passed through.
+/// In raw TTY REPL mode, bare LFs become CRLF (same staircase fix as `println`).
+@external(erlang, "gleshell_ffi", "write")
+pub fn write(text: String) -> Nil
+
+/// Terminal `{rows, cols}` when stdout is a TTY; Error otherwise.
+@external(erlang, "gleshell_ffi", "term_size")
+pub fn term_size() -> Result(#(Int, Int), Nil)
+
+/// One keypress for the builtin pager. See `gleshell_ffi:read_key_name/0`.
+/// Prefer calling inside `with_key_mode` when not in the raw REPL.
+@external(erlang, "gleshell_ffi", "read_key_name")
+pub fn read_key_name() -> Result(String, String)
+
+/// Run `body` with the TTY in single-key mode when needed (non-raw REPL).
+@external(erlang, "gleshell_ffi", "with_key_mode")
+pub fn with_key_mode(body: fn() -> Nil) -> Nil
+
 /// Run `body` as the interactive shell (raw TTY editor when possible).
 /// Ensures Erlang `+Bc` so Ctrl+C cancels the line instead of aborting the VM.
 @external(erlang, "gleshell_ffi", "run_as_shell")

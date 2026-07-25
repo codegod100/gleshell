@@ -10,7 +10,9 @@ import gleam/list
 import gleam/option
 import gleam/order
 import gleam/string
+import gleshell/display
 import gleshell/env.{type Env}
+import gleshell/pager
 import gleshell/sys
 import gleshell/value.{
   type Value, Bool, Fail, Float, Int, List, Nothing, Record, String, Table,
@@ -77,6 +79,8 @@ pub fn registry() -> dict.Dict(String, Builtin) {
     #("values", cmd_values),
     #("keys", cmd_keys),
     #("sys", cmd_sys),
+    #("about", cmd_about),
+    #("less", cmd_less),
   ])
 }
 
@@ -214,6 +218,30 @@ fn help_for(name: String) -> Result(String, Nil) {
         ],
         "\n",
       ))
+    "less" ->
+      Ok(string.join(
+        [
+          "less [file]… — page pipeline input or files (ANSI colors kept)",
+          "",
+          "Builtin pager inspired by less -FRX: colors from tools and gleshell",
+          "tables pass through; if the text fits on one screen (or stdout is not",
+          "a TTY), it is printed and the pager exits. Use `^less` for the",
+          "external binary on PATH.",
+          "",
+          "Keys (interactive):",
+          "  j / ↓ / Enter     line down     k / ↑        line up",
+          "  space / f / PgDn  page down     b / PgUp     page up",
+          "  g / Home          top           G / End      bottom",
+          "  h / ?             help          q / Ctrl+C   quit",
+          "",
+          "Examples:",
+          "  ls | less",
+          "  cat README.md | less",
+          "  less README.md",
+          "  ^jj log | less",
+        ],
+        "\n",
+      ))
     _ -> help_line(name)
   }
 }
@@ -293,6 +321,11 @@ fn help_text() -> dict.Dict(String, String) {
     #("values", "values — list of values from a record"),
     #("keys", "keys — list of keys from a record"),
     #("sys", "sys — host info record (cwd, home, shell, last_exit)"),
+    #("about", "about — authorship, ATProto handle, and a little sparkle"),
+    #(
+      "less",
+      "less [file]… — page pipeline input or files (ANSI colors kept)",
+    ),
   ])
 }
 
@@ -1717,6 +1750,107 @@ fn cmd_sys(
       #("shell", String("gleshell")),
       #("last_exit", Int(env.last_exit)),
     ]),
+  )
+}
+
+// --- less (color-aware pager) ---
+
+fn cmd_less(
+  env: Env,
+  input: Value,
+  args: List(Value),
+  _flags: dict.Dict(String, Value),
+) -> BuiltinResult {
+  case less_content(env, input, args) {
+    Error(msg) -> err(env, msg)
+    Ok(text) ->
+      case pager.needs_paging(text) {
+        True -> {
+          pager.run(text)
+          ok(env, Nothing)
+        }
+        // Fits on one screen or not a TTY: emit the text so the REPL / -c
+        // path prints it once (ANSI preserved by display.render for strings).
+        False -> ok(env, String(text))
+      }
+  }
+}
+
+/// Build the text to page: file args win (like external less); otherwise
+/// pipeline input. Raw strings (e.g. `git log` output) are kept byte-for-byte
+/// so embedded ANSI is not re-painted; structured values are pretty-printed
+/// with colors via `display.render`.
+fn less_content(
+  env: Env,
+  input: Value,
+  args: List(Value),
+) -> Result(String, String) {
+  case args {
+    [] ->
+      case input {
+        Nothing -> Error("less: no input (pipe data or pass a file path)")
+        // Do not run display.render on external text: short plain lines would
+        // get string-green, and multi-line ANSI must stay exactly as emitted.
+        String(s) -> Ok(s)
+        other -> Ok(display.render(other))
+      }
+    paths -> {
+      case list.try_map(paths, fn(a) {
+        case a {
+          String(path) -> read_less_file(env, path)
+          _ -> Error("less: expected file path")
+        }
+      }) {
+        Error(e) -> Error(e)
+        Ok(parts) -> Ok(string.join(parts, "\n"))
+      }
+    }
+  }
+}
+
+fn read_less_file(env: Env, path: String) -> Result(String, String) {
+  let path = resolve_path(env, path)
+  case simplifile.read(path) {
+    Ok(content) -> Ok(content)
+    Error(e) -> Error("less: " <> simplifile.describe_error(e))
+  }
+}
+
+// --- about ---
+
+fn cmd_about(
+  env: Env,
+  _input: Value,
+  _args: List(Value),
+  _flags: dict.Dict(String, Value),
+) -> BuiltinResult {
+  ok(env, String(about_text()))
+}
+
+fn about_text() -> String {
+  string.join(
+    [
+      "          ✨ gleshell ✨",
+      "   a structured-data shell in Gleam",
+      "   inspired by Nushell · pipelines with types",
+      "",
+      "        ╱|、",
+      "      (˚ˎ 。7",
+      "       |、˜〵",
+      "       じしˍ,)ノ  meow · you found the about page",
+      "",
+      "   author     NaNdi",
+      "   handle     @nandi.uk",
+      "   atproto    did:plc:ngokl2gnmpbvuvrfckja3g7p",
+      "   web        https://latha.org",
+      "   licence    Apache-2.0",
+      "",
+      "   \"a category is a quiver under the free functor\"",
+      "",
+      "   🐚  type `help` to explore · `^cmd` for externals",
+      "   💜  made for people who pipe records, not just text",
+    ],
+    "\n",
   )
 }
 

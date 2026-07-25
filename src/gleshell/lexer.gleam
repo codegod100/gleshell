@@ -88,7 +88,9 @@ fn do_tokenize(
     ["-", "-", ..rest] -> {
       let #(name, after, new_pos) = read_ident_body(rest, pos + 2, "")
       case name {
-        "" -> Error(LexError("expected flag name after --", pos))
+        // Bare `--` is the POSIX end-of-options marker (`nix run . -- args`).
+        // Empty flag name is parsed as a literal `"--"` argument.
+        "" -> do_tokenize(after, new_pos, [Flag(""), ..acc])
         n -> do_tokenize(after, new_pos, [Flag(n), ..acc])
       }
     }
