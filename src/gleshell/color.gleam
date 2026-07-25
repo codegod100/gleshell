@@ -172,12 +172,28 @@ pub fn prompt_name(on: Bool, text: String) -> String {
   paint(on, bold_green, text)
 }
 
+/// Directory segment (bold cyan — Starship-inspired).
 pub fn prompt_path(on: Bool, text: String) -> String {
-  paint(on, bright_blue, text)
+  paint(on, bold_cyan, text)
+}
+
+/// Git branch segment (bold purple — Starship-inspired).
+pub fn prompt_git(on: Bool, text: String) -> String {
+  paint(on, bold_purple, text)
 }
 
 pub fn prompt_mark(on: Bool, text: String) -> String {
   paint(on, bold, text)
+}
+
+/// Success character (bold green `❯`).
+pub fn prompt_character_ok(on: Bool, text: String) -> String {
+  paint(on, "\u{001b}[1;32m", text)
+}
+
+/// Error character after non-zero exit (bold red `❯`).
+pub fn prompt_character_err(on: Bool, text: String) -> String {
+  paint(on, bold_red, text)
 }
 
 // --- syntax shapes (Nushell `shape_*` defaults) ---

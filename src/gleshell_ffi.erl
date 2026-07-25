@@ -11,15 +11,17 @@
     getenv/1,
     setenv/2,
     list_env/0,
-    run_cmd/2,
-    run_cmd_tty/2,
+    run_cmd/3,
+    run_cmd_tty/3,
     which/1,
     which_all/1,
     home_dir/0,
     stdout_isatty/0,
     println/1,
     take_output_shown/0,
-    clear_output_shown/0
+    clear_output_shown/0,
+    complete_word/2,
+    re_contains/3
 ]).
 
 -define(ESC, 16#1b).
@@ -417,25 +419,30 @@ raw_loop(Prompt, Left, Right, History, HistPos, Saved) ->
     end.
 
 %% ---------------------------------------------------------------------------
-%% Tab: filename completion (path under cursor)
+%% Tab: command + filename completion (token under cursor)
 %% ---------------------------------------------------------------------------
 %%
-%% Completes the token before the cursor as a filesystem path.
-%% One match → insert it (directories get a trailing /).
+%% Command position (start of line / after | ; & =): complete builtins and
+%% PATH executables. Path-like command words (./foo, /bin/ls, ~/x) still use
+%% filename completion. Elsewhere: filename completion as before.
+%%
+%% One match → insert it (commands get a trailing space; dirs get /).
 %% Several matches → extend the longest common prefix; if that does not
 %% advance the buffer, list candidates under the line and redraw.
 
 tab_complete(Prompt, Left, Right, History, HistPos, Saved) ->
     {PrefixRev, Word} = word_before_cursor(Left),
-    case filename_completions(Word) of
+    {Matches, Kind} = completions_for(PrefixRev, Word),
+    case Matches of
         [] ->
             beep(),
             raw_loop(Prompt, Left, Right, History, HistPos, Saved);
         [Only] ->
-            NewLeft = apply_completed_word(PrefixRev, Only),
+            Insert = finalize_completion(Only, Kind),
+            NewLeft = apply_completed_word(PrefixRev, Insert),
             redraw(Prompt, NewLeft, Right),
             raw_loop(Prompt, NewLeft, Right, History, 0, <<>>);
-        Matches ->
+        _ ->
             Common = longest_common_prefix(Matches),
             case Common =/= Word andalso length(Common) >= length(Word) of
                 true ->
@@ -447,6 +454,155 @@ tab_complete(Prompt, Left, Right, History, HistPos, Saved) ->
                     redraw(Prompt, Left, Right),
                     raw_loop(Prompt, Left, Right, History, HistPos, Saved)
             end
+    end.
+
+%% Test/helper: return {Matches, Kind} for a buffer prefix and word.
+%% Prefix is the text *before* the word being completed (not reversed).
+%% Kind is <<"command">> | <<"path">>.
+-spec complete_word(binary(), binary()) -> {list(binary()), binary()}.
+complete_word(PrefixBin, WordBin) when is_binary(PrefixBin), is_binary(WordBin) ->
+    Prefix = unicode:characters_to_list(PrefixBin),
+    Word = unicode:characters_to_list(WordBin),
+    PrefixRev = lists:reverse(Prefix),
+    {Matches, Kind} = completions_for(PrefixRev, Word),
+    KindBin =
+        case Kind of
+            command -> <<"command">>;
+            path -> <<"path">>
+        end,
+    {
+        [unicode:characters_to_binary(M) || M <- Matches],
+        KindBin
+    }.
+
+%% Trailing space after a unique command so the user can type args next.
+finalize_completion(Word, command) ->
+    case lists:last(Word) of
+        $/ -> Word;
+        $\s -> Word;
+        _ -> Word ++ " "
+    end;
+finalize_completion(Word, path) ->
+    Word.
+
+completions_for(PrefixRev, Word) ->
+    case is_command_position(PrefixRev) andalso not is_path_like_word(Word) of
+        true ->
+            {command_completions(Word), command};
+        false ->
+            {filename_completions(Word), path}
+    end.
+
+%% Command position: empty prefix, or last non-space before the word is a
+%% pipeline/statement separator or assignment (`let x = …`).
+is_command_position(PrefixRev) ->
+    Before = string:trim(lists:reverse(PrefixRev), trailing),
+    case Before of
+        [] ->
+            true;
+        _ ->
+            case lists:last(Before) of
+                $| -> true;
+                $; -> true;
+                $& -> true;
+                $= -> true;
+                _ -> false
+            end
+    end.
+
+%% ./script, ../bin/x, /usr/bin/ls, ~/bin/foo — complete as paths even as cmds.
+is_path_like_word([]) ->
+    false;
+is_path_like_word(Word) ->
+    lists:member($/, Word) orelse lists:member($\\, Word) orelse hd(Word) =:= $~.
+
+%% Builtins + keywords + PATH executables matching Word as a prefix.
+command_completions(Word) ->
+    Builtins = [
+        N
+     || N <- builtin_command_names(),
+        lists:prefix(Word, N)
+    ],
+    Keywords = [
+        N
+     || N <- ["let"],
+        lists:prefix(Word, N)
+    ],
+    PathCmds =
+        case Word of
+            %% Empty prefix: skip PATH dump (can be thousands of names).
+            [] ->
+                [];
+            _ ->
+                path_command_completions(Word)
+        end,
+    lists:usort(Builtins ++ Keywords ++ PathCmds).
+
+%% Prefer live Gleam registry; fall back if the module is not loaded yet.
+builtin_command_names() ->
+    try
+        Names = 'gleshell@builtins':names(),
+        [to_charlist(N) || N <- Names]
+    catch
+        _:_ ->
+            fallback_builtin_names()
+    end.
+
+to_charlist(B) when is_binary(B) ->
+    unicode:characters_to_list(B);
+to_charlist(L) when is_list(L) ->
+    L.
+
+fallback_builtin_names() ->
+    [
+        "append", "cat", "cd", "columns", "count", "describe", "echo", "env",
+        "exit", "filter", "find", "first", "flatten", "from", "get", "help",
+        "identity", "ignore", "is-empty", "is_empty", "keys", "last", "length",
+        "lines", "ls", "open", "prepend", "print", "pwd", "quit", "range",
+        "reverse", "save", "select", "skip", "sort-by", "sort_by", "sys",
+        "table", "take", "to", "type", "typeof", "uniq", "unwrap",
+        "values", "where", "which", "wrap"
+    ].
+
+%% Executable basenames on PATH that match Prefix (deduped, sorted).
+path_command_completions(Prefix) ->
+    case os:getenv("PATH") of
+        false ->
+            [];
+        PathStr ->
+            Dirs = string:tokens(PathStr, path_sep()),
+            Acc = lists:foldl(
+                fun(Dir, Seen) ->
+                    collect_path_cmds(Dir, Prefix, Seen)
+                end,
+                #{},
+                Dirs
+            ),
+            lists:sort(maps:keys(Acc))
+    end.
+
+collect_path_cmds(Dir, Prefix, Seen) ->
+    case file:list_dir(Dir) of
+        {ok, Names} ->
+            lists:foldl(
+                fun(Name, Acc) ->
+                    case
+                        lists:prefix(Prefix, Name)
+                        andalso show_dotfile(Prefix, Name)
+                        andalso not maps:is_key(Name, Acc)
+                        andalso is_executable_file(filename:join(Dir, Name))
+                    of
+                        true ->
+                            Acc#{Name => true};
+                        false ->
+                            Acc
+                    end
+                end,
+                Seen,
+                Names
+            );
+        {error, _} ->
+            Seen
     end.
 
 beep() ->
@@ -1000,6 +1156,33 @@ list_env() ->
         os:getenv()
     ).
 
+%% Substring/regex search helper for the `find` builtin.
+%% Returns {ok, true|false} or {error, Message} on invalid pattern.
+-spec re_contains(binary(), binary(), boolean()) -> {ok, boolean()} | {error, binary()}.
+re_contains(Text, Pattern, IgnoreCase)
+  when is_binary(Text), is_binary(Pattern), is_boolean(IgnoreCase) ->
+    Opts0 = [unicode],
+    Opts =
+        case IgnoreCase of
+            true ->
+                [caseless | Opts0];
+            false ->
+                Opts0
+        end,
+    case re:compile(Pattern, Opts) of
+        {ok, Re} ->
+            case re:run(Text, Re, [{capture, none}]) of
+                match ->
+                    {ok, true};
+                nomatch ->
+                    {ok, false}
+            end;
+        {error, {Reason, _}} ->
+            {error, iolist_to_binary(io_lib:format("~p", [Reason]))};
+        {error, Reason} ->
+            {error, iolist_to_binary(io_lib:format("~p", [Reason]))}
+    end.
+
 -spec which(binary()) -> {ok, binary()} | {error, nil}.
 which(Command) when is_binary(Command) ->
     case which_all(Command) of
@@ -1107,26 +1290,27 @@ stdout_isatty() ->
 %% 1. `run_cmd/2` — capture stdout/stderr into a binary (pipelines, `let x =`,
 %%    non-TTY). Uses pipes; the child does NOT get a real terminal.
 %%
-%% 2. `run_cmd_tty/2` — foreground interactive. The child inherits the real
-%%    stdio FDs (`nouse_stdio`) so pagers (`less`), editors (`vim`), and most
-%%    TUI tools work. BEAM only waits on exit status; keys go straight to the
-%%    child (no broken PTY byte-relay).
+%% 2. `run_cmd_tty/2` — foreground interactive. Prefer util-linux `script`
+%%    (PTY + key relay via `io:get_chars`) so Ctrl+C can SIGINT the child.
+%%    `erl_child_setup` calls setsid, so the child is never in the terminal's
+%%    foreground process group — kernel SIGINT goes to BEAM, not the child.
+%%    Fallback: inherit real stdio (`nouse_stdio`) when script/TTY is missing.
 %%
-%% Auth tools (`sudo`, `run0`, …) need a *controlling* TTY; erl_child_setup
-%% calls setsid, so plain inherit is not enough. For those we wrap with
-%% util-linux `script` to allocate a PTY and relay keys via `io:get_chars`
-%% (same path as the raw line editor — a competing file:read on /dev/pts
-%% never sees keypresses while prim_tty owns the device).
+%% Auth tools (`sudo`, `run0`, …) also need a controlling TTY; the PTY path
+%% covers that. Host termios during children: cooked for OPOST/ONLCR (no
+%% staircase) but ISIG off so Ctrl+C is readable as byte 3 instead of opening
+%% the Erlang BREAK menu.
 %% ---------------------------------------------------------------------------
 
--spec run_cmd(binary(), [binary()]) -> {ok, {integer(), binary()}} | {error, binary()}.
-run_cmd(Command, Args) when is_binary(Command), is_list(Args) ->
+-spec run_cmd(binary(), [binary()], binary()) ->
+    {ok, {integer(), binary()}} | {error, binary()}.
+run_cmd(Command, Args, Stdin) when is_binary(Command), is_list(Args), is_binary(Stdin) ->
     case resolve_cmd(Command, Args) of
         {error, _} = E ->
             E;
         {ok, Path, PortArgs} ->
             try
-                run_cmd_capture(Path, PortArgs)
+                run_cmd_capture(Path, PortArgs, Stdin)
             catch
                 _:Reason ->
                     {error, reason_to_bin(Reason)}
@@ -1134,8 +1318,16 @@ run_cmd(Command, Args) when is_binary(Command), is_list(Args) ->
     end.
 
 %% Foreground interactive: inherit TTY when possible.
--spec run_cmd_tty(binary(), [binary()]) -> {ok, {integer(), binary()}} | {error, binary()}.
-run_cmd_tty(Command, Args) when is_binary(Command), is_list(Args) ->
+%% Non-empty Stdin is still fed (temp file + redirect) so `cat f | less` works.
+%%
+%% While the REPL uses OTP `{noshell, raw}`, prim_tty leaves termios with
+%% OPOST/ONLCR off so a bare LF does not return the cursor to column 0.
+%% Tools that write LF-only lines (fastfetch, many TUIs) look staircased if
+%% they inherit that TTY. Wrap inherit/PTY runs in cooked mode and restore
+%% raw afterwards (same idea as println/1 converting to CRLF for shell text).
+-spec run_cmd_tty(binary(), [binary()], binary()) ->
+    {ok, {integer(), binary()}} | {error, binary()}.
+run_cmd_tty(Command, Args, Stdin) when is_binary(Command), is_list(Args), is_binary(Stdin) ->
     case resolve_cmd(Command, Args) of
         {error, _} = E ->
             E;
@@ -1143,19 +1335,151 @@ run_cmd_tty(Command, Args) when is_binary(Command), is_list(Args) ->
             try
                 case stdout_isatty() of
                     false ->
-                        run_cmd_capture(Path, PortArgs);
+                        run_cmd_capture(Path, PortArgs, Stdin);
                     true ->
-                        case {needs_controlling_tty(Path), os:find_executable("script"), find_tty_path()} of
-                            {true, Script, {ok, Tty}} when is_list(Script) ->
-                                run_cmd_pty(Script, Path, PortArgs, Tty);
-                            _ ->
-                                run_cmd_inherit(Path, PortArgs)
-                        end
+                        with_cooked_tty(fun() ->
+                            %% PTY for all interactive when possible: key relay
+                            %% sees Ctrl+C and can SIGINT the child process group.
+                            case {os:find_executable("script"), find_tty_path()} of
+                                {Script, {ok, Tty}} when is_list(Script) ->
+                                    run_cmd_pty(Script, Path, PortArgs, Tty, Stdin);
+                                _ ->
+                                    run_cmd_inherit(Path, PortArgs, Stdin)
+                            end
+                        end)
                 end
             catch
                 _:Reason ->
                     {error, reason_to_bin(Reason)}
             end
+    end.
+
+%% Temporarily put the controlling TTY into cooked output + non-canonical
+%% input for an external child, then restore previous termios (raw REPL).
+%%
+%% Applied whenever stdout is a TTY (not only raw REPL): -c under a terminal
+%% still needs -isig/-icanon so Ctrl+C is a readable byte for the interrupt
+%% path. No-op when stty/TTY is unavailable.
+with_cooked_tty(Fun) when is_function(Fun, 0) ->
+    case stdout_isatty() of
+        false ->
+            Fun();
+        true ->
+            case stty_save() of
+                undefined ->
+                    %% Still try to apply host flags; restore is best-effort.
+                    stty_sane(),
+                    try
+                        Fun()
+                    after
+                        ok
+                    end;
+                Saved ->
+                    stty_sane(),
+                    try
+                        Fun()
+                    after
+                        stty_restore(Saved)
+                    end
+            end
+    end.
+
+stty_save() ->
+    case stty_run(["-g"]) of
+        {ok, Out} ->
+            case string:trim(Out, both, [$\s, $\t, $\n, $\r]) of
+                "" ->
+                    undefined;
+                Settings ->
+                    %% stty -g is a single token of colon-separated hex flags.
+                    Settings
+            end;
+        _ ->
+            undefined
+    end.
+
+stty_sane() ->
+    %% Host TTY while an external runs under the raw REPL:
+    %% - sane / opost / onlcr: LF→CRLF so children don't staircase
+    %% - -isig: Ctrl+C is byte 3 (not kernel SIGINT → BEAM BREAK menu)
+    %% - -icanon min 1 time 0: deliver each byte immediately — with ICANON
+    %%   left on, Ctrl+C sits in the line buffer until Enter and our key
+    %%   relay never sees it (external freezes; second ^C looks wedged)
+    %% - -echo: host must not echo keys we relay into the child PTY
+    _ = stty_run([
+        "sane",
+        "-isig",
+        "-icanon",
+        "min",
+        "1",
+        "time",
+        "0",
+        "-echo"
+    ]),
+    ok.
+
+stty_restore(Settings) when is_list(Settings) ->
+    _ = stty_run([Settings]),
+    ok;
+stty_restore(_) ->
+    ok.
+
+%% Run stty against the real terminal device (not a pipe). Prefer the pts
+%% path from /proc (same as sudo/PTY path), then `/dev/tty`.
+%%
+%% NOTE: do not use filelib:is_file/1 for `/dev/tty` — it is a device node,
+%% so is_file returns false and would skip stty entirely (fastfetch staircase).
+stty_run(Args) when is_list(Args) ->
+    case os:find_executable("stty") of
+        false ->
+            {error, no_stty};
+        Stty when is_list(Stty) ->
+            stty_run_on(Stty, Args, stty_devices())
+    end.
+
+stty_devices() ->
+    case find_tty_path() of
+        {ok, Path} ->
+            %% Prefer the concrete pts; /dev/tty is a fallback alias.
+            [Path, "/dev/tty"];
+        _ ->
+            ["/dev/tty"]
+    end.
+
+stty_run_on(_Stty, _Args, []) ->
+    {error, no_tty};
+stty_run_on(Stty, Args, [Dev | Rest]) ->
+    case stty_on_device(Stty, Dev, Args) of
+        {ok, _} = Ok ->
+            Ok;
+        _ ->
+            stty_run_on(Stty, Args, Rest)
+    end.
+
+stty_on_device(Stty, Dev, Args) when is_list(Stty), is_list(Dev), is_list(Args) ->
+    try
+        Port = open_port(
+            {spawn_executable, Stty},
+            [
+                binary,
+                exit_status,
+                use_stdio,
+                stderr_to_stdout,
+                {args, ["-F", Dev | Args]}
+            ]
+        ),
+        %% No interrupt watch — internal helper, must not steal TTY input.
+        case collect_output_quiet(Port, <<>>, 5000) of
+            {ok, {0, Bin}} ->
+                {ok, unicode:characters_to_list(Bin)};
+            {ok, {Status, Bin}} ->
+                {error, {Status, Bin}};
+            {error, _} = E ->
+                E
+        end
+    catch
+        _:_ ->
+            {error, stty_failed}
     end.
 
 resolve_cmd(Command, Args) ->
@@ -1167,97 +1491,249 @@ resolve_cmd(Command, Args) ->
             {ok, Path, PortArgs}
     end.
 
-%% Basename check for tools that need a controlling TTY (not just isatty).
-needs_controlling_tty(Path) when is_list(Path) ->
-    Base = filename:basename(Path),
-    lists:member(Base, ["sudo", "run0", "pkexec", "doas", "su"]).
-
 %% Capture mode: pipes, no TTY. `child_env` forces color when the shell wants
 %% it so tools like `jj` still embed ANSI we can pass through on display.
 %%
-%% Stdin is redirected from /dev/null via `sh -c` so programs that read stdin
-%% (bare `less`, `cat`, `wc`) get EOF immediately instead of hanging on an
-%% open-but-never-written pipe. (Port option `out` alone breaks exit_status
-%% delivery on current OTP.)
-run_cmd_capture(Path, PortArgs) ->
-    Sh =
-        case os:find_executable("sh") of
-            false ->
-                "/bin/sh";
-            S ->
-                S
-        end,
-    %% sh -c 'exec "$0" "$@" < /dev/null' path arg1 arg2 ...
-    %% $0 = Path; "$@" = remaining args — no shell-quoting of user args.
-    Port = open_port(
-        {spawn_executable, Sh},
-        [
-            binary,
-            exit_status,
-            stderr_to_stdout,
-            use_stdio,
-            stream,
-            {env, child_env()},
-            {args, ["-c", "exec \"$0\" \"$@\" < /dev/null", Path | PortArgs]}
-        ]
-    ),
-    put(gleshell_output_shown, false),
-    collect_output(Port, <<>>).
+%% Stdin is always redirected via `sh -c` + `$GLESHELL_STDIN` (either a temp
+%% file with pipeline bytes, or `/dev/null`) so programs never hang on an
+%% open-but-never-written Erlang port pipe.
+run_cmd_capture(Path, PortArgs, Stdin) when is_binary(Stdin) ->
+    with_stdin_file(Stdin, fun(StdinPath) ->
+        sh_exec(Path, PortArgs, StdinPath, capture)
+    end).
 
 %% Inherit real stdio — pagers/editors talk to the terminal directly.
 %% LESS=FRX (via child_env) lets less pass ANSI colors from jj/git.
-run_cmd_inherit(Path, PortArgs) ->
-    Port = open_port(
-        {spawn_executable, Path},
-        [
-            exit_status,
-            nouse_stdio,
-            {env, child_env()},
-            {args, PortArgs}
-        ]
-    ),
-    put(gleshell_output_shown, true),
-    %% No timeout: less/vim/top may run for a long time.
-    receive
-        {Port, {exit_status, Status}} ->
-            {ok, {Status, <<>>}}
+%%
+%% Empty stdin: pure inherit (bare `less` reads the TTY).
+%% Non-empty stdin: still inherit stdout/stderr TTY, but redirect stdin from
+%% a temp file so `cat file | less` pages the pipeline data.
+%%
+%% Ctrl+C: prefer the PTY path (key relay). Inherit is a fallback when
+%% `script` is missing — host is -isig/-icanon so Ctrl+C is byte 3; a
+%% watcher SIGINTs the child's process group (setsid means kernel SIGINT
+%% never reaches the child even with ISIG on).
+run_cmd_inherit(Path, PortArgs, Stdin) when is_binary(Stdin) ->
+    case Stdin of
+        <<>> ->
+            Port = open_port(
+                {spawn_executable, Path},
+                [
+                    exit_status,
+                    nouse_stdio,
+                    {env, child_env()},
+                    {args, PortArgs}
+                ]
+            ),
+            put(gleshell_output_shown, true),
+            await_port_exit_interruptible(Port);
+        _ ->
+            with_stdin_file(Stdin, fun(StdinPath) ->
+                sh_exec(Path, PortArgs, StdinPath, inherit)
+            end)
     end.
 
-%% Controlling-TTY + key relay for sudo/run0/etc.
-run_cmd_pty(Script, Path, PortArgs, TtyPath) ->
+%% PTY + key relay (interactive TTY, sudo/run0, …).
+%%
+%% util-linux `script` does NOT exec the argv after `--` directly. It runs
+%% `$SHELL -c "<joined args>"` (see script(1)). Nested
+%% `sh -c 'exec "$0" …' path` therefore becomes one mangled shell string and
+%% the real binary never runs (fastfetch → empty output, exit 0).
+%%
+%% Empty stdin: pass Path/args through as simple tokens (`script -- cmd args`).
+%% Non-empty stdin (pipeline → less): write a one-shot runner script that
+%% redirects and execs, then `script -- /tmp/runner` (single path token).
+run_cmd_pty(Script, Path, PortArgs, TtyPath, <<>>) ->
+    run_cmd_pty_argv(Script, [Path | PortArgs], TtyPath, Path, PortArgs, <<>>);
+run_cmd_pty(Script, Path, PortArgs, TtyPath, Stdin) when is_binary(Stdin) ->
+    with_stdin_file(Stdin, fun(StdinPath) ->
+        with_exec_runner(Path, PortArgs, StdinPath, fun(Runner) ->
+            run_cmd_pty_argv(Script, [Runner], TtyPath, Path, PortArgs, Stdin)
+        end)
+    end).
+
+run_cmd_pty_argv(Script, Argv, TtyPath, Path, PortArgs, Stdin) when is_list(Argv) ->
+    with_trapped_exits(fun() ->
+        Port = open_port(
+            {spawn_executable, Script},
+            [
+                binary,
+                exit_status,
+                stderr_to_stdout,
+                use_stdio,
+                stream,
+                {env, child_env()},
+                {args, ["-q", "-e", "/dev/null", "--" | Argv]}
+            ]
+        ),
+        case file:open(TtyPath, [write, raw, binary]) of
+            {ok, TtyOut} ->
+                GL = group_leader(),
+                Reader = spawn(fun() ->
+                    group_leader(GL, self()),
+                    io_to_port(Port)
+                end),
+                put(gleshell_output_shown, true),
+                try
+                    collect_output_relay(Port, TtyOut, <<>>)
+                after
+                    exit(Reader, kill),
+                    catch file:close(TtyOut),
+                    catch port_close(Port)
+                end;
+            {error, _} ->
+                catch port_close(Port),
+                put(gleshell_output_shown, false),
+                run_cmd_inherit(Path, PortArgs, Stdin)
+        end
+    end).
+
+%% One-shot `#!/bin/sh` runner: exec Path with PortArgs, stdin from StdinPath.
+%% Needed because `script` flattens argv into `$SHELL -c` (no real multi-arg exec).
+with_exec_runner(Path, PortArgs, StdinPath, Fun) when is_function(Fun, 1) ->
+    case write_runner_script(Path, PortArgs, StdinPath) of
+        {ok, Runner} ->
+            try
+                Fun(Runner)
+            after
+                _ = file:delete(Runner)
+            end;
+        {error, Reason} ->
+            {error, reason_to_bin({runner_script, Reason})}
+    end.
+
+write_runner_script(Path, PortArgs, StdinPath) ->
+    Dir =
+        case os:getenv("TMPDIR") of
+            false ->
+                "/tmp";
+            "" ->
+                "/tmp";
+            D ->
+                D
+        end,
+    Name =
+        filename:join(
+            Dir,
+            "gleshell-run-" ++ integer_to_list(erlang:unique_integer([positive]))
+        ),
+    Body = runner_script_body(Path, PortArgs, StdinPath),
+    case file:write_file(Name, Body) of
+        ok ->
+            case file:change_mode(Name, 8#755) of
+                ok ->
+                    {ok, Name};
+                {error, _} = E ->
+                    _ = file:delete(Name),
+                    E
+            end;
+        {error, _} = E ->
+            E
+    end.
+
+runner_script_body(Path, PortArgs, StdinPath) ->
+    ArgsQ = [[$\s, shell_single_quote(A)] || A <- PortArgs],
+    [
+        "#!/bin/sh\n",
+        "exec ",
+        shell_single_quote(Path),
+        ArgsQ,
+        " < ",
+        shell_single_quote(StdinPath),
+        "\n"
+    ].
+
+%% Safe single-quoted shell token (`foo'bar` → `'foo'\''bar'`).
+shell_single_quote(S) when is_list(S) ->
+    [$' | shell_single_quote_chars(S) ++ "'"];
+shell_single_quote(B) when is_binary(B) ->
+    shell_single_quote(unicode:characters_to_list(B)).
+
+shell_single_quote_chars([]) ->
+    [];
+shell_single_quote_chars([$' | Rest]) ->
+    "'\\''" ++ shell_single_quote_chars(Rest);
+shell_single_quote_chars([C | Rest]) ->
+    [C | shell_single_quote_chars(Rest)].
+
+find_sh() ->
+    case os:find_executable("sh") of
+        false ->
+            "/bin/sh";
+        S ->
+            S
+    end.
+
+%% Run Path with stdin redirected from StdinPath.
+%% Mode `capture` uses pipes; `inherit` uses nouse_stdio (real TTY for out/err).
+sh_exec(Path, PortArgs, StdinPath, capture) ->
     Port = open_port(
-        {spawn_executable, Script},
+        {spawn_executable, find_sh()},
         [
             binary,
             exit_status,
             stderr_to_stdout,
             use_stdio,
             stream,
-            {env, child_env()},
-            {args, ["-q", "-e", "/dev/null", "--", Path | PortArgs]}
+            {env, [{"GLESHELL_STDIN", StdinPath} | child_env()]},
+            {args, ["-c", "exec \"$0\" \"$@\" < \"$GLESHELL_STDIN\"", Path | PortArgs]}
         ]
     ),
-    case file:open(TtyPath, [write, raw, binary]) of
-        {ok, TtyOut} ->
-            GL = group_leader(),
-            Reader = spawn(fun() ->
-                group_leader(GL, self()),
-                io_to_port(Port)
-            end),
-            put(gleshell_output_shown, true),
+    put(gleshell_output_shown, false),
+    collect_output(Port, <<>>);
+sh_exec(Path, PortArgs, StdinPath, inherit) ->
+    Port = open_port(
+        {spawn_executable, find_sh()},
+        [
+            exit_status,
+            nouse_stdio,
+            {env, [{"GLESHELL_STDIN", StdinPath} | child_env()]},
+            {args, ["-c", "exec \"$0\" \"$@\" < \"$GLESHELL_STDIN\"", Path | PortArgs]}
+        ]
+    ),
+    put(gleshell_output_shown, true),
+    await_port_exit_interruptible(Port).
+
+%% Provide a filesystem path for stdin bytes; clean up temp files afterwards.
+with_stdin_file(<<>>, Fun) when is_function(Fun, 1) ->
+    Fun("/dev/null");
+with_stdin_file(Data, Fun) when is_binary(Data), is_function(Fun, 1) ->
+    case write_stdin_tmp(Data) of
+        {ok, Path} ->
             try
-                collect_output_relay(Port, TtyOut, <<>>)
+                Fun(Path)
             after
-                exit(Reader, kill),
-                catch file:close(TtyOut)
+                _ = file:delete(Path)
             end;
-        {error, _} ->
-            put(gleshell_output_shown, false),
-            %% Fall back to inherit rather than a silent capture hang.
-            run_cmd_inherit(Path, PortArgs)
+        {error, Reason} ->
+            {error, reason_to_bin({stdin_tmp, Reason})}
+    end.
+
+write_stdin_tmp(Data) when is_binary(Data) ->
+    Dir =
+        case os:getenv("TMPDIR") of
+            false ->
+                "/tmp";
+            "" ->
+                "/tmp";
+            D ->
+                D
+        end,
+    Name =
+        filename:join(
+            Dir,
+            "gleshell-stdin-" ++ integer_to_list(erlang:unique_integer([positive]))
+        ),
+    case file:write_file(Name, Data) of
+        ok ->
+            {ok, Name};
+        {error, _} = E ->
+            E
     end.
 
 %% Relay keypresses from the group leader to the child's PTY (script stdin).
+%% Ctrl+C (ETX / byte 3): SIGINT the child process group, and still write the
+%% byte so the PTY line discipline can deliver SIGINT on the slave side too.
 io_to_port(Port) ->
     case io:get_chars("", 1) of
         eof ->
@@ -1267,6 +1743,10 @@ io_to_port(Port) ->
         Data ->
             case io_data_to_bin(Data) of
                 <<>> ->
+                    io_to_port(Port);
+                <<3>> = Bin ->
+                    signal_port_group(Port, int),
+                    catch port_command(Port, Bin),
                     io_to_port(Port);
                 Bin ->
                     catch port_command(Port, Bin),
@@ -1288,21 +1768,137 @@ io_data_to_bin(List) when is_list(List) ->
 io_data_to_bin(_) ->
     <<>>.
 
+%% When a port's OS process is killed (Ctrl+C → SIGINT), the linked port may
+%% exit with `epipe` / signal reasons. Without trap_exit the shell process
+%% dies with "Erlang exit: Epipe" instead of returning to the prompt.
+with_trapped_exits(Fun) when is_function(Fun, 0) ->
+    Old = process_flag(trap_exit, true),
+    try
+        Fun()
+    after
+        process_flag(trap_exit, Old),
+        drain_exit_msgs()
+    end.
+
+drain_exit_msgs() ->
+    receive
+        {'EXIT', _, _} ->
+            drain_exit_msgs()
+    after 0 ->
+        ok
+    end.
+
+%% Inherit path: watch for Ctrl+C (byte 3) and SIGINT the child group.
+%% Used when `script`/PTY is unavailable; same kill path as the PTY relay.
+await_port_exit_interruptible(Port) ->
+    with_trapped_exits(fun() ->
+        with_interrupt_watch(Port, fun() ->
+            await_port_exit_interruptible_loop(Port)
+        end)
+    end).
+
+await_port_exit_interruptible_loop(Port) ->
+    receive
+        {Port, {exit_status, Status}} ->
+            {ok, {Status, <<>>}};
+        {'EXIT', Port, _Reason} ->
+            {ok, {130, <<>>}};
+        {gleshell_interrupt, _} ->
+            signal_port_group(Port, int),
+            await_port_exit_after_interrupt(Port, 2000)
+    end.
+
+await_port_exit_after_interrupt(Port, GraceMs) ->
+    receive
+        {Port, {exit_status, Status}} ->
+            {ok, {Status, <<>>}};
+        {'EXIT', Port, _Reason} ->
+            {ok, {130, <<>>}};
+        {gleshell_interrupt, _} ->
+            signal_port_group(Port, kill),
+            await_port_exit_after_interrupt(Port, 1000)
+    after GraceMs ->
+        signal_port_group(Port, kill),
+        catch port_close(Port),
+        receive
+            {Port, {exit_status, Status}} ->
+                {ok, {Status, <<>>}};
+            {'EXIT', Port, _} ->
+                {ok, {130, <<>>}}
+        after 1000 ->
+            {ok, {130, <<>>}}
+        end
+    end.
+
 collect_output(Port, Acc) ->
+    with_trapped_exits(fun() ->
+        with_interrupt_watch(Port, fun() ->
+            collect_output_loop(Port, Acc, 120_000)
+        end)
+    end).
+
+collect_output_loop(Port, Acc, Timeout) ->
     receive
         {Port, {data, Data}} when is_binary(Data) ->
-            collect_output(Port, <<Acc/binary, Data/binary>>);
+            collect_output_loop(Port, <<Acc/binary, Data/binary>>, Timeout);
         {Port, {data, Data}} when is_list(Data) ->
             Bin = unicode:characters_to_binary(Data),
-            collect_output(Port, <<Acc/binary, Bin/binary>>);
+            collect_output_loop(Port, <<Acc/binary, Bin/binary>>, Timeout);
         {Port, {exit_status, Status}} ->
-            {ok, {Status, Acc}}
-    after 120_000 ->
+            {ok, {Status, Acc}};
+        {'EXIT', Port, _Reason} ->
+            {ok, {130, Acc}};
+        {gleshell_interrupt, _} ->
+            signal_port_group(Port, int),
+            collect_output_after_interrupt(Port, Acc, 2000)
+    after Timeout ->
+        signal_port_group(Port, term),
         catch port_close(Port),
         {error, <<"command timed out after 120s">>}
     end.
 
-%% PTY auth session: no timeout (password prompts, etc.).
+collect_output_after_interrupt(Port, Acc, GraceMs) ->
+    receive
+        {Port, {data, Data}} when is_binary(Data) ->
+            collect_output_after_interrupt(
+                Port, <<Acc/binary, Data/binary>>, GraceMs
+            );
+        {Port, {data, Data}} when is_list(Data) ->
+            Bin = unicode:characters_to_binary(Data),
+            collect_output_after_interrupt(
+                Port, <<Acc/binary, Bin/binary>>, GraceMs
+            );
+        {Port, {exit_status, Status}} ->
+            {ok, {Status, Acc}};
+        {'EXIT', Port, _Reason} ->
+            {ok, {130, Acc}};
+        {gleshell_interrupt, _} ->
+            signal_port_group(Port, kill),
+            collect_output_after_interrupt(Port, Acc, 1000)
+    after GraceMs ->
+        signal_port_group(Port, kill),
+        catch port_close(Port),
+        receive
+            {Port, {data, Data}} when is_binary(Data) ->
+                collect_output_after_interrupt(
+                    Port, <<Acc/binary, Data/binary>>, 500
+                );
+            {Port, {data, Data}} when is_list(Data) ->
+                Bin = unicode:characters_to_binary(Data),
+                collect_output_after_interrupt(
+                    Port, <<Acc/binary, Bin/binary>>, 500
+                );
+            {Port, {exit_status, Status}} ->
+                {ok, {Status, Acc}};
+            {'EXIT', Port, _} ->
+                {ok, {130, Acc}}
+        after 1000 ->
+            {ok, {130, Acc}}
+        end
+    end.
+
+%% PTY session: no timeout (password prompts, long pagers, etc.).
+%% Ctrl+C is handled in io_to_port/1 (SIGINT); also accept interrupt msgs.
 collect_output_relay(Port, Tty, Acc) ->
     receive
         {Port, {data, Data}} when is_binary(Data) ->
@@ -1313,7 +1909,175 @@ collect_output_relay(Port, Tty, Acc) ->
             _ = file:write(Tty, Bin),
             collect_output_relay(Port, Tty, <<Acc/binary, Bin/binary>>);
         {Port, {exit_status, Status}} ->
-            {ok, {Status, normalize_pty_output(Acc)}}
+            {ok, {Status, normalize_pty_output(Acc)}};
+        {gleshell_interrupt, _} ->
+            signal_port_group(Port, int),
+            collect_output_relay_after_interrupt(Port, Tty, Acc, 2000)
+    end.
+
+collect_output_relay_after_interrupt(Port, Tty, Acc, GraceMs) ->
+    receive
+        {Port, {data, Data}} when is_binary(Data) ->
+            _ = file:write(Tty, Data),
+            collect_output_relay_after_interrupt(
+                Port, Tty, <<Acc/binary, Data/binary>>, GraceMs
+            );
+        {Port, {data, Data}} when is_list(Data) ->
+            Bin = unicode:characters_to_binary(Data),
+            _ = file:write(Tty, Bin),
+            collect_output_relay_after_interrupt(
+                Port, Tty, <<Acc/binary, Bin/binary>>, GraceMs
+            );
+        {Port, {exit_status, Status}} ->
+            {ok, {Status, normalize_pty_output(Acc)}};
+        {gleshell_interrupt, _} ->
+            signal_port_group(Port, kill),
+            collect_output_relay_after_interrupt(Port, Tty, Acc, 1000)
+    after GraceMs ->
+        signal_port_group(Port, kill),
+        catch port_close(Port),
+        receive
+            {Port, {exit_status, Status}} ->
+                {ok, {Status, normalize_pty_output(Acc)}}
+        after 1000 ->
+            {ok, {130, normalize_pty_output(Acc)}}
+        end
+    end.
+
+%% ---------------------------------------------------------------------------
+%% Ctrl+C / SIGINT forwarding
+%%
+%% BEAM's open_port → erl_child_setup → setsid, so the child is not in the
+%% terminal foreground group. Host ISIG is left off while a child runs; we
+%% watch for byte 3 (ETX) and kill(-pid, SIGINT) on the child's process group.
+%% ---------------------------------------------------------------------------
+
+with_interrupt_watch(_Port, Fun) when is_function(Fun, 0) ->
+    Parent = self(),
+    GL = group_leader(),
+    Watcher =
+        case can_watch_interrupt() of
+            true ->
+                spawn(fun() ->
+                    group_leader(GL, self()),
+                    interrupt_watch_loop(Parent)
+                end);
+            false ->
+                undefined
+        end,
+    try
+        Fun()
+    after
+        case Watcher of
+            undefined ->
+                ok;
+            W ->
+                exit(W, kill),
+                drain_interrupt_msgs()
+        end
+    end.
+
+%% Collect port output without Ctrl+C watching (stty and other helpers).
+collect_output_quiet(Port, Acc, Timeout) ->
+    receive
+        {Port, {data, Data}} when is_binary(Data) ->
+            collect_output_quiet(Port, <<Acc/binary, Data/binary>>, Timeout);
+        {Port, {data, Data}} when is_list(Data) ->
+            Bin = unicode:characters_to_binary(Data),
+            collect_output_quiet(Port, <<Acc/binary, Bin/binary>>, Timeout);
+        {Port, {exit_status, Status}} ->
+            {ok, {Status, Acc}}
+    after Timeout ->
+        catch port_close(Port),
+        {error, <<"command timed out">>}
+    end.
+
+%% Watch when the REPL owns the TTY (raw mode) or stdin is a terminal.
+can_watch_interrupt() ->
+    case get(gleshell_raw) of
+        true ->
+            true;
+        _ ->
+            stdout_isatty()
+    end.
+
+interrupt_watch_loop(Parent) when is_pid(Parent) ->
+    case catch io:get_chars("", 1) of
+        eof ->
+            ok;
+        {error, _} ->
+            ok;
+        {'EXIT', _} ->
+            ok;
+        Data ->
+            case io_data_to_bin(Data) of
+                <<3>> ->
+                    Parent ! {gleshell_interrupt, self()},
+                    interrupt_watch_loop(Parent);
+                _ ->
+                    %% Non-Ctrl+C: discard here (capture mode). Interactive
+                    %% PTY uses io_to_port instead; inherit prefers PTY.
+                    interrupt_watch_loop(Parent)
+            end
+    end.
+
+drain_interrupt_msgs() ->
+    receive
+        {gleshell_interrupt, _} ->
+            drain_interrupt_msgs()
+    after 0 ->
+        ok
+    end.
+
+%% SIGINT/SIGTERM/SIGKILL the port's OS process group (setsid → pgid = pid).
+signal_port_group(Port, Sig) when is_port(Port) ->
+    case erlang:port_info(Port, os_pid) of
+        {os_pid, Pid} when is_integer(Pid), Pid > 0 ->
+            kill_os_group(Pid, Sig);
+        _ ->
+            ok
+    end.
+
+kill_os_group(Pid, Sig) when is_integer(Pid) ->
+    Kill =
+        case os:find_executable("kill") of
+            false ->
+                "kill";
+            K ->
+                K
+        end,
+    SigArg =
+        case Sig of
+            int ->
+                "-INT";
+            term ->
+                "-TERM";
+            kill ->
+                "-KILL"
+        end,
+    %% Negative pid → process group (child is session/group leader after setsid).
+    Pg = "-" ++ integer_to_list(Pid),
+    Single = integer_to_list(Pid),
+    _ = kill_once(Kill, [SigArg, Pg]),
+    _ = kill_once(Kill, [SigArg, Single]),
+    ok.
+
+kill_once(Kill, Args) ->
+    try
+        Port = open_port(
+            {spawn_executable, Kill},
+            [exit_status, nouse_stdio, {args, Args}]
+        ),
+        receive
+            {Port, {exit_status, _}} ->
+                ok
+        after 1000 ->
+            catch port_close(Port),
+            ok
+        end
+    catch
+        _:_ ->
+            ok
     end.
 
 %% PTY line discipline often emits CR-LF; normalize to LF for structured use.

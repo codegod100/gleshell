@@ -1,5 +1,7 @@
+import gleam/list
 import gleam/string
 import gleeunit
+import gleshell/builtins
 import gleshell/color
 import gleshell/display
 import gleshell/env
@@ -136,6 +138,22 @@ pub fn eval_pipeline_reverse_first_test() {
   Nil
 }
 
+/// Pipeline input must become the external's stdin (`cat f | less`, `echo hi | wc`).
+/// Use `let` so the last stage is capture mode even on a TTY (bare expressions
+/// may inherit the terminal and return an empty string value).
+pub fn eval_pipeline_stdin_to_external_test() {
+  let env = env.new()
+  // `echo` is a builtin; `wc` is external. Count bytes of "hello" (no trailing NL).
+  let assert eval.Continue(_, String(out)) =
+    eval.eval_source(env, "let n = echo hello | ^wc -c")
+  let assert True = string.contains(out, "5")
+  // Tight `cmd|cmd` form (no spaces around pipe)
+  let assert eval.Continue(_, String(out2)) =
+    eval.eval_source(env, "let m = echo ab|^wc -c")
+  let assert True = string.contains(out2, "2")
+  Nil
+}
+
 pub fn eval_let_and_var_test() {
   let env = env.new()
   let assert eval.Continue(env2, Int(7)) =
@@ -213,6 +231,41 @@ pub fn eval_where_select_test() {
   Nil
 }
 
+pub fn help_covers_all_builtins_test() {
+  // Every registered builtin must have a dedicated help_text entry.
+  let assert [] = builtins.missing_help()
+
+  let env = env.new()
+  // which finds builtins; help must too (not "unknown command")
+  let assert eval.Continue(_, String(which_out)) =
+    eval.eval_source(env, "which table")
+  let assert "builtin: table" = which_out
+  let assert eval.Continue(_, String(help_out)) =
+    eval.eval_source(env, "help table")
+  let assert True = string.contains(help_out, "table")
+  let assert True = string.contains(help_out, "coerce")
+
+  // Parent commands with subcommands: `help to` / `help from` must resolve.
+  let assert eval.Continue(_, String(to_help)) =
+    eval.eval_source(env, "help to")
+  let assert True = string.contains(to_help, "json")
+  let assert eval.Continue(_, String(from_help)) =
+    eval.eval_source(env, "help from")
+  let assert True = string.contains(from_help, "json")
+
+  // Bare help lists every command with its one-line description.
+  let assert eval.Continue(_, String(all)) = eval.eval_source(env, "help")
+  list.each(builtins.names(), fn(name) {
+    let assert True = string.contains(all, name)
+  })
+
+  let assert eval.Continue(env2, value.Fail(msg)) =
+    eval.eval_source(env, "help not-a-real-cmd")
+  let assert True = string.contains(msg, "unknown command")
+  let assert 1 = env2.last_exit
+  Nil
+}
+
 pub fn eval_from_json_test() {
   let env = env.new()
   let assert eval.Continue(_, Record(fields)) =
@@ -223,7 +276,7 @@ pub fn eval_from_json_test() {
 
 pub fn eval_to_json_pretty_test() {
   let env = env.new()
-  // Nushell-style multi-word `to json` — pretty by default
+  // `to` command + `json` subcommand — pretty by default
   let assert eval.Continue(_, String(pretty)) =
     eval.eval_source(env, "echo [1 2 3] | to json")
   let assert True = string.contains(pretty, "\n")
@@ -232,6 +285,14 @@ pub fn eval_to_json_pretty_test() {
   let assert eval.Continue(_, String(raw)) =
     eval.eval_source(env, "echo [1 2 3] | to json --raw")
   let assert "[1,2,3]" = raw
+  // Missing / unknown subcommand
+  let assert eval.Continue(env2, value.Fail(msg)) =
+    eval.eval_source(env, "echo 1 | to")
+  let assert True = string.contains(msg, "subcommand")
+  let assert 1 = env2.last_exit
+  let assert eval.Continue(_, value.Fail(msg2)) =
+    eval.eval_source(env, "echo 1 | to yaml")
+  let assert True = string.contains(msg2, "unknown subcommand")
   Nil
 }
 
@@ -270,6 +331,69 @@ pub fn eval_which_builtin_test() {
   let env = env.new()
   let assert eval.Continue(_, String("builtin: ls")) =
     eval.eval_source(env, "which ls")
+  Nil
+}
+
+pub fn eval_find_list_test() {
+  let env = env.new()
+  // Substring match (OR across terms)
+  let assert eval.Continue(_, List(items)) =
+    eval.eval_source(env, "echo [moe larry curly] | find l")
+  let assert [String("larry"), String("curly")] = items
+  // Multiple terms
+  let assert eval.Continue(_, List(items2)) =
+    eval.eval_source(env, "echo [a.toml b.md c.rs] | find toml md")
+  let assert [String("a.toml"), String("b.md")] = items2
+  // Exact number match
+  let assert eval.Continue(_, List([Int(5)])) =
+    eval.eval_source(env, "echo [1 5 3 4 35] | find 5")
+  Nil
+}
+
+pub fn eval_find_ignore_case_invert_test() {
+  let env = env.new()
+  let assert eval.Continue(_, List(items)) =
+    eval.eval_source(env, "echo [Hello world HELLO] | find hello -i")
+  let assert [String("Hello"), String("HELLO")] = items
+  // `-i term` may attach term to the flag; still works
+  let assert eval.Continue(_, List(items2)) =
+    eval.eval_source(env, "echo [Hello world HELLO] | find -i hello")
+  let assert [String("Hello"), String("HELLO")] = items2
+  let assert eval.Continue(_, List([String("cd")])) =
+    eval.eval_source(env, "echo [ab cd] | find --invert a")
+  Nil
+}
+
+pub fn eval_find_table_and_string_test() {
+  let env = env.new()
+  let assert eval.Continue(_, Table(["name", "type"], rows)) =
+    eval.eval_source(
+      env,
+      "echo [{name: a, type: file} {name: b, type: dir}] | table | find file",
+    )
+  let assert [[String("a"), String("file")]] = rows
+  // Single-line string: return the string if match, else nothing
+  let assert eval.Continue(_, String("Cargo.toml")) =
+    eval.eval_source(env, "echo Cargo.toml | find Cargo")
+  let assert eval.Continue(_, Nothing) =
+    eval.eval_source(env, "echo Cargo.toml | find zz")
+  // Multi-line string → list of matching lines
+  let assert eval.Continue(_, List(lines)) =
+    eval.eval_source(env, "echo \"hi\nbye\nhi there\" | find hi")
+  let assert [String("hi"), String("hi there")] = lines
+  Nil
+}
+
+pub fn eval_find_regex_test() {
+  let env = env.new()
+  let assert eval.Continue(_, List(items)) =
+    eval.eval_source(env, "echo [abc odb arc abf] | find --regex \"b.\"")
+  let assert [String("abc"), String("abf")] = items
+  // Regex + terms is rejected (Nu-compatible)
+  let assert eval.Continue(env2, value.Fail(msg)) =
+    eval.eval_source(env, "echo [abc] | find --regex \"b.\" x")
+  let assert True = string.contains(msg, "regex")
+  let assert 1 = env2.last_exit
   Nil
 }
 
@@ -345,6 +469,30 @@ pub fn display_table_headers_colored_test() {
   Nil
 }
 
+pub fn format_filesize_units_test() {
+  let assert "0 B" = display.format_filesize(0)
+  let assert "512 B" = display.format_filesize(512)
+  let assert "1023 B" = display.format_filesize(1023)
+  let assert "1 KB" = display.format_filesize(1024)
+  let assert "1.5 KB" = display.format_filesize(1536)
+  let assert "1 MB" = display.format_filesize(1_048_576)
+  let assert "1.5 MB" = display.format_filesize(1_048_576 + 524_288)
+  let assert "1 GB" = display.format_filesize(1_073_741_824)
+  Nil
+}
+
+pub fn display_size_column_humanized_test() {
+  // Data stays as raw bytes (Int); only display shows KB/MB.
+  let text =
+    display.render_with(
+      False,
+      Table(["name", "size"], [[String("a"), Int(2048)]]),
+    )
+  let assert True = string_contains(text, "2 KB")
+  let assert False = string_contains(text, "2048")
+  Nil
+}
+
 pub fn color_visible_length_strips_ansi_test() {
   let painted = color.paint(True, "\u{001b}[32m", "hi")
   let assert 2 = color.visible_length(painted)
@@ -399,9 +547,11 @@ pub fn highlight_incomplete_string_test() {
   Nil
 }
 
-pub fn highlight_to_json_multiword_test() {
+pub fn highlight_to_command_test() {
+  // `to` is a builtin; `json` is a subcommand arg
   let text = highlight.highlight(True, "range 3 | to json")
-  let assert True = string_contains(text, "to json")
+  let assert True = string_contains(text, "to")
+  let assert True = string_contains(text, "json")
   let assert True = string_contains(text, "\u{001b}[1;36m")
   Nil
 }
@@ -420,5 +570,70 @@ fn string_contains(haystack: String, needle: String) -> Bool {
   case string.split(haystack, needle) {
     [_] -> False
     _ -> True
+  }
+}
+
+// --- tab completion ---
+
+pub fn complete_command_builtin_test() {
+  // Start of line: complete builtins
+  let #(matches, kind) = sys.complete_word("", "ech")
+  let assert True = kind == "command"
+  let assert True = list_contains(matches, "echo")
+  // After pipeline separator
+  let #(matches2, kind2) = sys.complete_word("ls | ", "wher")
+  let assert True = kind2 == "command"
+  let assert True = list_contains(matches2, "where")
+  // `to` / `from` are single-word commands (subcommand is a normal arg)
+  let #(matches3, kind3) = sys.complete_word("", "to")
+  let assert True = kind3 == "command"
+  let assert True = list_contains(matches3, "to")
+  let #(matches_from, kind_from) = sys.complete_word("", "fro")
+  let assert True = kind_from == "command"
+  let assert True = list_contains(matches_from, "from")
+  // Keyword
+  let #(matches4, kind4) = sys.complete_word("", "le")
+  let assert True = kind4 == "command"
+  let assert True = list_contains(matches4, "let")
+  Nil
+}
+
+pub fn complete_command_after_assign_test() {
+  let #(matches, kind) = sys.complete_word("let x = ", "ran")
+  let assert True = kind == "command"
+  let assert True = list_contains(matches, "range")
+  Nil
+}
+
+pub fn complete_path_for_args_test() {
+  // After a command name, Tab completes files not commands
+  let #(_matches, kind) = sys.complete_word("echo ", "ech")
+  let assert True = kind == "path"
+  Nil
+}
+
+pub fn complete_path_like_command_test() {
+  // Path-shaped command words stay on filename completion
+  let #(_matches, kind) = sys.complete_word("", "./ec")
+  let assert True = kind == "path"
+  let #(_matches2, kind2) = sys.complete_word("", "/us")
+  let assert True = kind2 == "path"
+  Nil
+}
+
+pub fn complete_path_executable_test() {
+  // PATH + builtins for a non-empty prefix
+  let #(matches, kind) = sys.complete_word("", "s")
+  let assert True = kind == "command"
+  // At least builtins starting with s (select, skip, sort-by, …)
+  let assert True = list_contains(matches, "select")
+  Nil
+}
+
+fn list_contains(items: List(String), needle: String) -> Bool {
+  case items {
+    [] -> False
+    [x, ..] if x == needle -> True
+    [_, ..rest] -> list_contains(rest, needle)
   }
 }

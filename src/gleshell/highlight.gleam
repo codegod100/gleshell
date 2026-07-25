@@ -360,34 +360,6 @@ fn paint_command(
   builtins: List(String),
   acc: String,
 ) -> String {
-  // Multi-word builtins: `to json`, `from json`
-  case word {
-    "to" | "from" -> {
-      let #(ws, rest1) = take_space(after)
-      let #(next, rest2) = take_ident(rest1)
-      case next {
-        "json" -> {
-          let full = word <> ws <> next
-          paint_chars(
-            rest2,
-            ExpectArg,
-            builtins,
-            acc <> color.shape_internalcall(True, full),
-          )
-        }
-        _ -> paint_single_command(word, after, builtins, acc)
-      }
-    }
-    _ -> paint_single_command(word, after, builtins, acc)
-  }
-}
-
-fn paint_single_command(
-  word: String,
-  after: List(String),
-  builtins: List(String),
-  acc: String,
-) -> String {
   let painted = case list.contains(builtins, word) {
     True -> color.shape_internalcall(True, word)
     False -> color.shape_external(True, word)
@@ -399,18 +371,6 @@ fn next_expect(expect: Expect) -> Expect {
   case expect {
     ExpectCommand -> ExpectArg
     ExpectArg -> ExpectArg
-  }
-}
-
-fn take_space(chars: List(String)) -> #(String, List(String)) {
-  take_space_loop(chars, "")
-}
-
-fn take_space_loop(chars: List(String), acc: String) -> #(String, List(String)) {
-  case chars {
-    [" ", ..rest] -> take_space_loop(rest, acc <> " ")
-    ["\t", ..rest] -> take_space_loop(rest, acc <> "\t")
-    _ -> #(acc, chars)
   }
 }
 

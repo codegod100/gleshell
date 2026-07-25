@@ -97,8 +97,8 @@ fn render_record(on: Bool, fields: List(#(String, Value))) -> String {
           let #(k, v) = pair
           let key = color.key(on, pad_right(k, key_w))
           let bar = color.separator(on, "│")
-          let cell =
-            color_cell_for_column(on, k, v, value.cell_string(v), type_hint)
+          let plain = cell_plain(k, v)
+          let cell = color_cell_for_column(on, k, v, plain, type_hint)
           "  " <> key <> " " <> bar <> " " <> cell
         })
       let top = color.separator(on, "╭──── record ───")
@@ -120,8 +120,16 @@ fn render_table_with(
   case columns {
     [] -> color.nothing(on, "(empty table)")
     _ -> {
+      // Column-aware plain text (e.g. size → KB/MB) for widths and coloring.
       let plain_cells: List(List(String)) =
-        list.map(rows, fn(row) { list.map(row, value.cell_string) })
+        list.map(rows, fn(row) {
+          list.index_map(columns, fn(col, i) {
+            case list_at(row, i) {
+              Ok(v) -> cell_plain(col, v)
+              Error(Nil) -> ""
+            }
+          })
+        })
 
       // Widths use visible length so cells with ANSI (from external tools)
       // do not inflate the table.
@@ -243,6 +251,51 @@ fn list_index_of_loop(
         True -> Ok(i)
         False -> list_index_of_loop(rest, target, i + 1)
       }
+  }
+}
+
+/// Plain cell text before coloring. Keeps pipeline data as raw ints; only
+/// display converts `size` byte counts to KB/MB/….
+fn cell_plain(col: String, value: Value) -> String {
+  case col, value {
+    "size", Int(n) -> format_filesize(n)
+    _, _ -> value.cell_string(value)
+  }
+}
+
+/// Format a byte count for display: B below 1 KiB, then KB / MB / GB / TB
+/// (1024-based). One decimal place when the fractional part is non-zero.
+pub fn format_filesize(bytes: Int) -> String {
+  let n = case bytes < 0 {
+    True -> 0
+    False -> bytes
+  }
+  case n < 1024 {
+    True -> int.to_string(n) <> " B"
+    False ->
+      case n < 1_048_576 {
+        True -> scale_unit(n, 1024, " KB")
+        False ->
+          case n < 1_073_741_824 {
+            True -> scale_unit(n, 1_048_576, " MB")
+            False ->
+              case n < 1_099_511_627_776 {
+                True -> scale_unit(n, 1_073_741_824, " GB")
+                False -> scale_unit(n, 1_099_511_627_776, " TB")
+              }
+          }
+      }
+  }
+}
+
+fn scale_unit(n: Int, unit: Int, suffix: String) -> String {
+  // tenths with half-up rounding: (n * 10 + unit/2) / unit
+  let tenths = { n * 10 + unit / 2 } / unit
+  let whole = tenths / 10
+  let frac = tenths % 10
+  case frac {
+    0 -> int.to_string(whole) <> suffix
+    _ -> int.to_string(whole) <> "." <> int.to_string(frac) <> suffix
   }
 }
 

@@ -38,6 +38,7 @@ pub fn registry() -> dict.Dict(String, Builtin) {
     #("save", cmd_save),
     #("where", cmd_where),
     #("filter", cmd_where),
+    #("find", cmd_find),
     #("select", cmd_select),
     #("get", cmd_get),
     #("first", cmd_first),
@@ -52,9 +53,9 @@ pub fn registry() -> dict.Dict(String, Builtin) {
     #("uniq", cmd_uniq),
     #("wrap", cmd_wrap),
     #("unwrap", cmd_unwrap),
-    // Nushell multi-word: `to json` / `from json`
-    #("to json", cmd_to_json),
-    #("from json", cmd_from_json),
+    // Nushell-style: `to` / `from` with format subcommands (`json`)
+    #("to", cmd_to),
+    #("from", cmd_from),
     #("lines", cmd_lines),
     #("typeof", cmd_type),
     #("type", cmd_type),
@@ -85,6 +86,11 @@ pub fn names() -> List(String) {
   |> list.sort(string.compare)
 }
 
+/// Registered builtins that lack a dedicated `help_text` entry (should be empty).
+pub fn missing_help() -> List(String) {
+  list.filter(names(), fn(n) { !dict.has_key(help_text(), n) })
+}
+
 fn ok(env: Env, value: Value) -> BuiltinResult {
   BuiltinResult(env, value)
 }
@@ -103,11 +109,18 @@ fn cmd_help(
 ) -> BuiltinResult {
   case args {
     [String(name)] ->
-      case dict.get(help_text(), name) {
+      case help_for(name) {
         Ok(text) -> ok(env, String(text))
         Error(Nil) -> err(env, "unknown command: " <> name)
       }
     _ -> {
+      let command_lines =
+        list.map(names(), fn(n) {
+          case help_line(n) {
+            Ok(text) -> "  " <> text
+            Error(Nil) -> "  " <> n
+          }
+        })
       let lines =
         list.append(
           [
@@ -120,7 +133,7 @@ fn cmd_help(
             "",
             "Commands:",
           ],
-          list.append(list.map(names(), fn(n) { "  " <> n }), [
+          list.append(command_lines, [
             "",
             "Use `help <command>` for details. `^cmd` forces an external binary.",
             "Variables: `let x = ...` then `$x`. Pipeline input is `$in`.",
@@ -132,11 +145,87 @@ fn cmd_help(
   }
 }
 
+/// One-line help for a registered builtin, or Error if the name is not a builtin.
+fn help_line(name: String) -> Result(String, Nil) {
+  case dict.get(help_text(), name) {
+    Ok(text) -> Ok(text)
+    Error(Nil) ->
+      case dict.has_key(registry(), name) {
+        // Safety net if help_text drifts; `missing_help` / tests should catch this.
+        True -> Ok(name <> " — builtin command")
+        False -> Error(Nil)
+      }
+  }
+}
+
+/// Full help text for `help <name>`, including subcommands where relevant.
+fn help_for(name: String) -> Result(String, Nil) {
+  case name {
+    "to" ->
+      Ok(string.join(
+        [
+          "to <format> — convert pipeline input to a text format",
+          "",
+          "Subcommands:",
+          "  json [--raw|-r] [--indent|-i n] — JSON string (pretty by default;",
+          "                                   --raw is compact, no trailing newline)",
+          "",
+          "Examples:",
+          "  range 3 | to json",
+          "  ls | to json --raw",
+        ],
+        "\n",
+      ))
+    "from" ->
+      Ok(string.join(
+        [
+          "from <format> — parse text input into structured data",
+          "",
+          "Subcommands:",
+          "  json — parse a JSON string (pipeline input or a string argument)",
+          "",
+          "Examples:",
+          "  open data.json | from json",
+          "  echo '{\"a\": 1}' | from json | get a",
+        ],
+        "\n",
+      ))
+    "find" ->
+      Ok(string.join(
+        [
+          "find [-i] [-v] [--regex pat] [--columns cols] <term>… — search pipeline input",
+          "",
+          "Filters lists/tables for items matching any term (OR). Strings use",
+          "substring match; numbers/bools match by equality. Multi-line strings",
+          "are split into lines (unless --multiline).",
+          "",
+          "Flags:",
+          "  -i, --ignore-case     case-insensitive match",
+          "  -v, --invert          keep non-matching items",
+          "  -r, --regex <pat>     Erlang regex (not combined with terms)",
+          "  -c, --columns <list>  only search these table columns",
+          "  -m, --multiline       do not split multi-line strings into lines",
+          "",
+          "Examples:",
+          "  ls | find toml md",
+          "  echo [moe larry curly] | find l",
+          "  echo [Hello world] | find hello -i",
+          "  echo [abc odb abf] | find --regex \"b.\"",
+        ],
+        "\n",
+      ))
+    _ -> help_line(name)
+  }
+}
+
 fn help_text() -> dict.Dict(String, String) {
   dict.from_list([
+    #("help", "help [command] — list builtins, or show help for one command"),
+    #("echo", "echo <values>… — emit values (list if multiple)"),
+    #("print", "print <values>… — alias for echo"),
     #("ls", "ls [path] — list directory entries as a table"),
-    #("cd", "cd [path] — change directory (~ supported)"),
     #("pwd", "pwd — print working directory"),
+    #("cd", "cd [path] — change directory (~ supported)"),
     #("cat", "cat <path> — read file as string"),
     #("open", "open <path> — open file; parses .json into structured data"),
     #("save", "save <path> — save pipeline input to a file"),
@@ -144,31 +233,66 @@ fn help_text() -> dict.Dict(String, String) {
       "where",
       "where <field> <op> <value> — filter rows (ops: == != > < >= <=)",
     ),
+    #("filter", "filter <field> <op> <value> — alias for where"),
+    #(
+      "find",
+      "find [-i] [-v] [--regex pat] <term>… — search list/table/string input for terms",
+    ),
     #("select", "select <col>… — keep only named columns"),
     #("get", "get <field|index> — get a field or list index"),
     #("first", "first [n] — first row/item (default 1)"),
     #("last", "last [n] — last row/item"),
-    #("take", "take <n> — take first n rows"),
-    #("skip", "skip <n> — skip first n rows"),
-    #("echo", "echo <values>… — emit values (list if multiple)"),
+    #("take", "take <n> — take first n items"),
+    #("skip", "skip <n> — skip first n items"),
+    #("length", "length — number of items in list/table/string input"),
+    #("count", "count — alias for length"),
+    #("reverse", "reverse — reverse list, table rows, or string graphemes"),
+    #("sort-by", "sort-by <field> — sort table rows by field"),
+    #("sort_by", "sort_by <field> — alias for sort-by"),
+    #("uniq", "uniq — drop duplicate list items (order preserved)"),
+    #("wrap", "wrap <name> — wrap pipeline input as a single-field record"),
+    #("unwrap", "unwrap [name] — unwrap a record field (default: first field)"),
     #(
-      "to json",
-      "to json [--raw|-r] [--indent|-i n] — convert input to JSON string (pretty by default)",
+      "to",
+      "to <format> — convert pipeline input (subcommands: json)",
     ),
     #(
-      "from json",
-      "from json — parse JSON string input into structured data",
+      "from",
+      "from <format> — parse structured input (subcommands: json)",
     ),
-    #("range", "range <end> | range <start> <end> — integer range list"),
+    #("lines", "lines — split string input into a list of lines"),
+    #("typeof", "typeof — type name of pipeline input"),
+    #("type", "type — alias for typeof"),
+    #(
+      "describe",
+      "describe — record with type, length, and string form of input",
+    ),
     #(
       "env",
       "env [NAME] — process environment table, or one var (same as `$env` / `$env.NAME`)",
     ),
-    #("sys", "sys — host info record"),
     #(
       "which",
       "which [-a|--all] <name> — path of command (builtin or on PATH); -a lists all matches",
     ),
+    #("exit", "exit [code] — leave the shell (default code 0)"),
+    #("quit", "quit [code] — alias for exit"),
+    #("ignore", "ignore — discard pipeline input; emit nothing"),
+    #("identity", "identity — pass pipeline input through unchanged"),
+    #("range", "range <end> | range <start> <end> — integer range list"),
+    #("append", "append <values>… — append values to list input"),
+    #("prepend", "prepend <values>… — prepend values to list input"),
+    #("is-empty", "is-empty — true if list/table/string input has length 0"),
+    #("is_empty", "is_empty — alias for is-empty"),
+    #(
+      "table",
+      "table — coerce list of records (or table) into a table",
+    ),
+    #("columns", "columns — column names of a table, or keys of a record"),
+    #("flatten", "flatten — one level of list-of-lists flattening"),
+    #("values", "values — list of values from a record"),
+    #("keys", "keys — list of keys from a record"),
+    #("sys", "sys — host info record (cwd, home, shell, last_exit)"),
   ])
 }
 
@@ -410,6 +534,314 @@ fn row_matches(row: Value, field: String, op: String, rhs: Value) -> Bool {
           }
         _ -> False
       }
+  }
+}
+
+// --- find (Nushell-style search filter) ---
+
+fn cmd_find(
+  env: Env,
+  input: Value,
+  args: List(Value),
+  flags: dict.Dict(String, Value),
+) -> BuiltinResult {
+  // Boolean flags may steal the next word (`find -i hello` → flag i = "hello").
+  let #(ignore_case, stolen_i) =
+    find_bool_flag(flags, ["i", "ignore-case"])
+  let #(invert, stolen_v) = find_bool_flag(flags, ["v", "invert"])
+  let #(multiline, stolen_m) = find_bool_flag(flags, ["m", "multiline"])
+  let #(_, stolen_n) = find_bool_flag(flags, ["n", "no-highlight"])
+  let #(_, stolen_s) = find_bool_flag(flags, ["s", "dotall"])
+  let #(_, stolen_rfind) = find_bool_flag(flags, ["R", "rfind"])
+
+  let regex_opt = find_regex_pattern(flags)
+  let columns = find_columns(flags)
+
+  let terms =
+    list.flatten([
+      args,
+      stolen_i,
+      stolen_v,
+      stolen_m,
+      stolen_n,
+      stolen_s,
+      stolen_rfind,
+    ])
+
+  case terms, regex_opt {
+    [], option.None ->
+      err(env, "find: expected search term(s) or --regex <pattern>")
+    _, option.Some(Error(msg)) -> err(env, "find: " <> msg)
+    [_, ..], option.Some(Ok(_)) ->
+      err(env, "find: cannot use --regex with additional search terms")
+    terms, regex_opt -> {
+      let pattern = case regex_opt {
+        option.Some(Ok(p)) -> option.Some(p)
+        _ -> option.None
+      }
+      case
+        find_filter(
+          input,
+          terms,
+          pattern,
+          ignore_case,
+          invert,
+          multiline,
+          columns,
+        )
+      {
+        Ok(v) -> ok(env, v)
+        Error(msg) -> err(env, "find: " <> msg)
+      }
+    }
+  }
+}
+
+/// Parse a boolean flag that may have stolen a following value as its arg.
+/// Returns `(flag_set, stolen_terms)`.
+fn find_bool_flag(
+  flags: dict.Dict(String, Value),
+  names: List(String),
+) -> #(Bool, List(Value)) {
+  list.fold(names, #(False, []), fn(acc, name) {
+    let #(_set, stolen) = acc
+    case dict.get(flags, name) {
+      Error(Nil) -> acc
+      Ok(Bool(False)) | Ok(Nothing) -> acc
+      Ok(Bool(True)) -> #(True, stolen)
+      Ok(v) -> #(True, list.append(stolen, [v]))
+    }
+  })
+}
+
+fn find_regex_pattern(
+  flags: dict.Dict(String, Value),
+) -> option.Option(Result(String, String)) {
+  case dict.get(flags, "regex"), dict.get(flags, "r") {
+    Ok(String(p)), _ -> option.Some(Ok(p))
+    _, Ok(String(p)) -> option.Some(Ok(p))
+    Ok(Bool(True)), _ | _, Ok(Bool(True)) ->
+      option.Some(Error("regex flag requires a pattern (try `find --regex <pat>`)"))
+    Ok(other), _ ->
+      option.Some(Ok(value.as_string(other)))
+    _, Ok(other) -> option.Some(Ok(value.as_string(other)))
+    Error(Nil), Error(Nil) -> option.None
+  }
+}
+
+fn find_columns(flags: dict.Dict(String, Value)) -> option.Option(List(String)) {
+  case dict.get(flags, "columns"), dict.get(flags, "c") {
+    Ok(v), _ -> columns_from_value(v)
+    _, Ok(v) -> columns_from_value(v)
+    Error(Nil), Error(Nil) -> option.None
+  }
+}
+
+fn columns_from_value(v: Value) -> option.Option(List(String)) {
+  case v {
+    List(items) -> {
+      let cols =
+        list.filter_map(items, fn(item) {
+          case item {
+            String(s) -> Ok(s)
+            other -> Ok(value.as_string(other))
+          }
+        })
+      option.Some(cols)
+    }
+    String(s) -> option.Some([s])
+    _ -> option.Some([value.as_string(v)])
+  }
+}
+
+fn find_filter(
+  input: Value,
+  terms: List(Value),
+  regex: option.Option(String),
+  ignore_case: Bool,
+  invert: Bool,
+  multiline: Bool,
+  columns: option.Option(List(String)),
+) -> Result(Value, String) {
+  case input {
+    List(items) -> {
+      case filter_items(items, terms, regex, ignore_case, invert, columns) {
+        Ok(kept) -> Ok(List(kept))
+        Error(e) -> Error(e)
+      }
+    }
+    Table(_, _) ->
+      case value.table_to_records(input) {
+        Error(e) -> Error(e)
+        Ok(rows) ->
+          case filter_items(rows, terms, regex, ignore_case, invert, columns) {
+            Ok(kept) -> Ok(value.table_from_records(kept))
+            Error(e) -> Error(e)
+          }
+      }
+    String(s) ->
+      case multiline || !string.contains(s, "\n") {
+        True ->
+          case item_matches(String(s), terms, regex, ignore_case, option.None) {
+            Error(e) -> Error(e)
+            Ok(matched) ->
+              case matched != invert {
+                True -> Ok(String(s))
+                False -> Ok(Nothing)
+              }
+          }
+        False -> {
+          let lines = list.map(string.split(s, "\n"), String)
+          case filter_items(lines, terms, regex, ignore_case, invert, option.None) {
+            Ok(kept) -> Ok(List(kept))
+            Error(e) -> Error(e)
+          }
+        }
+      }
+    Nothing -> Error("pipeline input is required (try `ls | find term`)")
+    other ->
+      // Single scalar / record: keep if it matches, else nothing.
+      case item_matches(other, terms, regex, ignore_case, columns) {
+        Error(e) -> Error(e)
+        Ok(matched) ->
+          case matched != invert {
+            True -> Ok(other)
+            False -> Ok(Nothing)
+          }
+      }
+  }
+}
+
+fn filter_items(
+  items: List(Value),
+  terms: List(Value),
+  regex: option.Option(String),
+  ignore_case: Bool,
+  invert: Bool,
+  columns: option.Option(List(String)),
+) -> Result(List(Value), String) {
+  list.try_fold(items, [], fn(acc, item) {
+    case item_matches(item, terms, regex, ignore_case, columns) {
+      Error(e) -> Error(e)
+      Ok(matched) ->
+        case matched != invert {
+          True -> Ok(list.append(acc, [item]))
+          False -> Ok(acc)
+        }
+    }
+  })
+}
+
+fn item_matches(
+  item: Value,
+  terms: List(Value),
+  regex: option.Option(String),
+  ignore_case: Bool,
+  columns: option.Option(List(String)),
+) -> Result(Bool, String) {
+  case item {
+    Record(fields) -> {
+      let fields = case columns {
+        option.None -> fields
+        option.Some(cols) ->
+          list.filter(fields, fn(pair) {
+            let #(k, _) = pair
+            list.contains(cols, k)
+          })
+      }
+      // Match if any selected field matches (OR), or exact record equality.
+      case list.any(terms, fn(t) { value.equals(item, t) }) {
+        True -> Ok(True)
+        False ->
+          list.try_fold(fields, False, fn(acc, pair) {
+            case acc {
+              True -> Ok(True)
+              False -> {
+                let #(_, v) = pair
+                item_matches(v, terms, regex, ignore_case, option.None)
+              }
+            }
+          })
+      }
+    }
+    List(inner) -> {
+      // Nested list: match if any element matches, or the rendered text does.
+      case
+        list.try_fold(inner, False, fn(acc, v) {
+          case acc {
+            True -> Ok(True)
+            False -> item_matches(v, terms, regex, ignore_case, option.None)
+          }
+        })
+      {
+        Error(e) -> Error(e)
+        Ok(True) -> Ok(True)
+        Ok(False) ->
+          text_matches(value.as_string(item), terms, regex, ignore_case)
+      }
+    }
+    // Scalars: exact equality always; strings also allow substring contains.
+    // Numbers/bools do not substring-match (Nu: `find 5` does not keep 35).
+    String(s) -> text_matches(s, terms, regex, ignore_case)
+    Int(_) | Float(_) | Bool(_) -> scalar_matches(item, terms, regex, ignore_case)
+    Nothing -> scalar_matches(item, terms, regex, ignore_case)
+    other -> {
+      case list.any(terms, fn(t) { value.equals(other, t) }) {
+        True -> Ok(True)
+        False -> text_matches(value.as_string(other), terms, regex, ignore_case)
+      }
+    }
+  }
+}
+
+fn scalar_matches(
+  scalar: Value,
+  terms: List(Value),
+  regex: option.Option(String),
+  ignore_case: Bool,
+) -> Result(Bool, String) {
+  case regex {
+    option.Some(pattern) ->
+      text_matches(
+        value.as_string(scalar),
+        terms,
+        option.Some(pattern),
+        ignore_case,
+      )
+    option.None -> Ok(list.any(terms, fn(t) { value.equals(scalar, t) }))
+  }
+}
+
+fn text_matches(
+  text: String,
+  terms: List(Value),
+  regex: option.Option(String),
+  ignore_case: Bool,
+) -> Result(Bool, String) {
+  case regex {
+    option.Some(pattern) ->
+      case sys.re_contains(text, pattern, ignore_case) {
+        Ok(b) -> Ok(b)
+        Error(msg) -> Error("invalid regex: " <> msg)
+      }
+    option.None -> {
+      let haystack = case ignore_case {
+        True -> string.lowercase(text)
+        False -> text
+      }
+      Ok(
+        list.any(terms, fn(term) {
+          let needle = case ignore_case {
+            True -> string.lowercase(value.as_string(term))
+            False -> value.as_string(term)
+          }
+          case needle {
+            "" -> True
+            _ -> string.contains(haystack, needle)
+          }
+        }),
+      )
+    }
   }
 }
 
@@ -723,7 +1155,37 @@ fn cmd_unwrap(
   }
 }
 
-// --- json (mirrors Nushell `to json` / `from json`) ---
+// --- to / from (Nushell-style format commands with subcommands) ---
+
+fn cmd_to(
+  env: Env,
+  input: Value,
+  args: List(Value),
+  flags: dict.Dict(String, Value),
+) -> BuiltinResult {
+  case args {
+    [String("json"), ..rest] -> cmd_to_json(env, input, rest, flags)
+    [] ->
+      err(env, "to: expected subcommand (try `to json`; see `help to`)")
+    [String(sub), ..] -> err(env, "to: unknown subcommand: " <> sub)
+    _ -> err(env, "to: expected subcommand name")
+  }
+}
+
+fn cmd_from(
+  env: Env,
+  input: Value,
+  args: List(Value),
+  flags: dict.Dict(String, Value),
+) -> BuiltinResult {
+  case args {
+    [String("json"), ..rest] -> cmd_from_json(env, input, rest, flags)
+    [] ->
+      err(env, "from: expected subcommand (try `from json`; see `help from`)")
+    [String(sub), ..] -> err(env, "from: unknown subcommand: " <> sub)
+    _ -> err(env, "from: expected subcommand name")
+  }
+}
 
 fn cmd_to_json(
   env: Env,
@@ -770,11 +1232,11 @@ fn cmd_from_json(
     _ -> ""
   }
   case source {
-    "" -> err(env, "from json: empty input")
+    "" -> err(env, "from: json: empty input")
     s ->
       case parse_json_value(s) {
         Ok(v) -> ok(env, v)
-        Error(msg) -> err(env, "from json: " <> msg)
+        Error(msg) -> err(env, "from: json: " <> msg)
       }
   }
 }

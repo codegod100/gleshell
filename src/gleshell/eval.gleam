@@ -116,7 +116,7 @@ fn eval_command(
         True ->
           case eval_argv(env, args) {
             Error(msg) -> Continue(env.set_exit(env, 1), Fail(msg))
-            Ok(str_args) -> run_external(env, name, str_args, interactive)
+            Ok(str_args) -> run_external(env, name, str_args, input, interactive)
           }
         False ->
           case eval_args(env, args) {
@@ -124,9 +124,9 @@ fn eval_command(
             Ok(#(pos, flags)) -> {
               // Builtins produce a new value that was not streamed to the TTY.
               sys.clear_output_shown()
-              case resolve_builtin(name, pos) {
-                Ok(#(builtin, pos2)) ->
-                  case builtin(env, input, pos2, flags) {
+              case dict.get(builtins.registry(), name) {
+                Ok(builtin) ->
+                  case builtin(env, input, pos, flags) {
                     builtins.Exit(code) -> Quit(code)
                     builtins.BuiltinResult(env2, value) -> {
                       let env2 = case value {
@@ -141,33 +141,13 @@ fn eval_command(
                   case eval_argv(env, args) {
                     Error(msg) -> Continue(env.set_exit(env, 1), Fail(msg))
                     Ok(str_args) ->
-                      run_external(env, name, str_args, interactive)
+                      run_external(env, name, str_args, input, interactive)
                   }
               }
             }
           }
       }
     }
-  }
-}
-
-/// Look up a builtin, including Nushell-style multi-word names (`to json`).
-/// When `name` alone is missing, try consuming a following bare string arg.
-fn resolve_builtin(
-  name: String,
-  pos: List(Value),
-) -> Result(#(builtins.Builtin, List(Value)), Nil) {
-  case dict.get(builtins.registry(), name) {
-    Ok(builtin) -> Ok(#(builtin, pos))
-    Error(Nil) ->
-      case pos {
-        [String(sub), ..rest] ->
-          case dict.get(builtins.registry(), name <> " " <> sub) {
-            Ok(builtin) -> Ok(#(builtin, rest))
-            Error(Nil) -> Error(Nil)
-          }
-        _ -> Error(Nil)
-      }
   }
 }
 
@@ -261,11 +241,14 @@ fn run_external(
   env: Env,
   name: String,
   str_args: List(String),
+  input: Value,
   interactive: Bool,
 ) -> EvalResult {
+  // Pipeline input becomes the external's stdin (Unix-style `cmd | less`).
+  let stdin = stdin_bytes(input)
   let result = case interactive {
-    True -> sys.run_cmd_tty(name, str_args)
-    False -> sys.run_cmd(name, str_args)
+    True -> sys.run_cmd_tty(name, str_args, stdin)
+    False -> sys.run_cmd(name, str_args, stdin)
   }
   case result {
     Error(msg) -> Continue(env.set_exit(env, 127), Fail(msg))
@@ -281,5 +264,14 @@ fn run_external(
           })
       }
     }
+  }
+}
+
+/// Bytes fed to an external's stdin from the previous pipeline stage.
+fn stdin_bytes(input: Value) -> String {
+  case input {
+    Nothing -> ""
+    String(s) -> s
+    other -> value.as_string(other)
   }
 }

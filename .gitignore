@@ -2,6 +2,8 @@
 *.ez
 /build
 erl_crash.dump
+# gleam export escript writes here
+/gleshell
 
 # Nix / devenv
 /result
