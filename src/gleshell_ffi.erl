@@ -1899,6 +1899,7 @@ collect_output_after_interrupt(Port, Acc, GraceMs) ->
 
 %% PTY session: no timeout (password prompts, long pagers, etc.).
 %% Ctrl+C is handled in io_to_port/1 (SIGINT); also accept interrupt msgs.
+%% Caller must run under with_trapped_exits/1 so port epipe is not fatal.
 collect_output_relay(Port, Tty, Acc) ->
     receive
         {Port, {data, Data}} when is_binary(Data) ->
@@ -1910,6 +1911,8 @@ collect_output_relay(Port, Tty, Acc) ->
             collect_output_relay(Port, Tty, <<Acc/binary, Bin/binary>>);
         {Port, {exit_status, Status}} ->
             {ok, {Status, normalize_pty_output(Acc)}};
+        {'EXIT', Port, _Reason} ->
+            {ok, {130, normalize_pty_output(Acc)}};
         {gleshell_interrupt, _} ->
             signal_port_group(Port, int),
             collect_output_relay_after_interrupt(Port, Tty, Acc, 2000)
@@ -1930,6 +1933,8 @@ collect_output_relay_after_interrupt(Port, Tty, Acc, GraceMs) ->
             );
         {Port, {exit_status, Status}} ->
             {ok, {Status, normalize_pty_output(Acc)}};
+        {'EXIT', Port, _Reason} ->
+            {ok, {130, normalize_pty_output(Acc)}};
         {gleshell_interrupt, _} ->
             signal_port_group(Port, kill),
             collect_output_relay_after_interrupt(Port, Tty, Acc, 1000)
@@ -1938,7 +1943,9 @@ collect_output_relay_after_interrupt(Port, Tty, Acc, GraceMs) ->
         catch port_close(Port),
         receive
             {Port, {exit_status, Status}} ->
-                {ok, {Status, normalize_pty_output(Acc)}}
+                {ok, {Status, normalize_pty_output(Acc)}};
+            {'EXIT', Port, _} ->
+                {ok, {130, normalize_pty_output(Acc)}}
         after 1000 ->
             {ok, {130, normalize_pty_output(Acc)}}
         end
