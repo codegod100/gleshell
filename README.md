@@ -19,7 +19,8 @@ Requires [Gleam](https://gleam.run/getting-started/) and Erlang (or use Nix):
 
 ```bash
 # with Nix flake (dev shell: gleam, erlang, rebar3)
-nix develop
+# --no-pure-eval lets devenv use the real project dir (not /nix/store)
+nix develop --no-pure-eval
 gleam run                 # interactive REPL
 gleam run -- -c 'ls | first 3'
 gleam test
@@ -33,17 +34,24 @@ gleam run
 
 ### REPL editing
 
-The interactive REPL uses Erlang’s line editor (`edlin`):
+On a TTY the interactive REPL uses a **raw-mode line editor** with
+**Nushell-style syntax highlighting** as you type (commands cyan, strings
+green, numbers purple, pipes purple, flags blue, variables purple, …).
 
 | Key | Action |
 |-----|--------|
-| ↑ / ↓ or Ctrl+P / Ctrl+N | History |
+| ↑ / ↓ | History |
+| **Tab** | Filename completion (common prefix; list matches if ambiguous) |
 | **Ctrl+R** | Reverse-i-search through history |
 | Ctrl+A / Ctrl+E | Beginning / end of line |
 | Ctrl+W | Delete previous word |
-| Ctrl+C / Ctrl+G | Cancel search / interrupt |
+| Ctrl+U / Ctrl+K | Kill to start / end of line |
+| Ctrl+L | Clear screen |
+| **Ctrl+C** | Cancel current line (does not exit the shell) |
+| Ctrl+D | EOF (empty line) or delete under cursor |
 
-History is persisted under the user cache as `gleshell-history` (OTP `shell_history`).
+History is persisted under the user cache as `gleshell-history/lines`.
+Non-TTY input falls back to Erlang’s `edlin`/`get_until` path.
 
 ## Examples
 
@@ -65,6 +73,12 @@ range 3 | to json
 let n = range 3 | length
 echo $n
 
+# process environment (Nushell-style)
+$env.HOME
+$env | get PATH
+$env.MY_VAR = hello
+echo $env.MY_VAR
+
 # external programs (stdout captured as a string)
 ^uname -a
 which ls
@@ -82,6 +96,7 @@ which ls
 | Lists | `[1 2 3]` |
 | Records | `{name: alice, age: 30}` |
 | Variables | `let x = …` then `$x` (pipeline input is `$in`) |
+| Env | `$env`, `$env.HOME`, `$env.FOO = value` |
 | Flags | `--flag` / `--flag value` |
 | Force external | `^command args…` |
 | Comments | `# …` |
@@ -109,11 +124,13 @@ src/
     builtins.gleam        # Nu-inspired commands
     display.gleam         # table pretty-printer
     color.gleam           # Nushell-style ANSI colors
+    highlight.gleam       # live input syntax highlighting
     env.gleam / sys.gleam
 ```
 
-Output is colorized on a TTY (headers bold green, numbers purple, bools cyan,
-dirs blue, errors red, …). Disable with `NO_COLOR=1`; force with `FORCE_COLOR=1`.
+Input and output are colorized on a TTY (Nu-like shapes on the command line;
+headers bold green, numbers purple, bools cyan, dirs blue, errors red, …).
+Disable with `NO_COLOR=1`; force with `FORCE_COLOR=1`.
 
 ## Status
 

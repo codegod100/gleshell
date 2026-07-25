@@ -124,6 +124,7 @@ fn cmd_help(
             "",
             "Use `help <command>` for details. `^cmd` forces an external binary.",
             "Variables: `let x = ...` then `$x`. Pipeline input is `$in`.",
+            "Env: `$env`, `$env.HOME`, `$env.FOO = bar` (process environment).",
           ]),
         )
       ok(env, String(string.join(lines, "\n")))
@@ -159,6 +160,10 @@ fn help_text() -> dict.Dict(String, String) {
       "from json — parse JSON string input into structured data",
     ),
     #("range", "range <end> | range <start> <end> — integer range list"),
+    #(
+      "env",
+      "env [NAME] — process environment table, or one var (same as `$env` / `$env.NAME`)",
+    ),
     #("sys", "sys — host info record"),
   ])
 }
@@ -971,21 +976,25 @@ fn cmd_env(
   _flags: dict.Dict(String, Value),
 ) -> BuiltinResult {
   case args {
-    [String(name)] -> ok(env, env.get_var(env, name))
+    [String(name)] -> ok(env, env.get_var(env, "env." <> name))
     [] -> {
-      let pairs =
-        env.vars
-        |> dict.to_list
-        |> list.map(fn(pair) {
-          let #(k, v) = pair
-          Record([
-            #("name", String(k)),
-            #("value", String(value.as_string(v))),
-          ])
-        })
-      ok(env, value.table_from_records(pairs))
+      // Process environment (same data as `$env`), as a name/value table
+      case env.env_record(env) {
+        Record(fields) -> {
+          let pairs =
+            list.map(fields, fn(pair) {
+              let #(k, v) = pair
+              Record([
+                #("name", String(k)),
+                #("value", String(value.as_string(v))),
+              ])
+            })
+          ok(env, value.table_from_records(pairs))
+        }
+        other -> ok(env, other)
+      }
     }
-    _ -> err(env, "env: unexpected args")
+    _ -> err(env, "env: unexpected args (use `env` or `env NAME`)")
   }
 }
 

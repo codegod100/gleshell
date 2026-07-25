@@ -7,8 +7,8 @@ import gleam/string
 import gleshell/builtins
 import gleshell/env.{type Env}
 import gleshell/parser.{
-  type Arg, type Command, type Expr, type Pipeline, type Statement, FlagArg, Let,
-  ListExpr, Lit, RecordExpr, ValueArg, Var,
+  type Arg, type Command, type Expr, type Pipeline, type Statement, EnvAssign,
+  FlagArg, Let, ListExpr, Lit, RecordExpr, ValueArg, Var,
 }
 import gleshell/sys
 import gleshell/value.{type Value, Fail, List, Nothing, Record, String}
@@ -19,6 +19,8 @@ pub type EvalResult {
 }
 
 pub fn eval_source(env: Env, source: String) -> EvalResult {
+  // Fresh statement — do not inherit a prior external command's TTY-shown flag.
+  sys.clear_output_shown()
   let source = string.trim(source)
   case source {
     "" -> Continue(env, Nothing)
@@ -42,6 +44,20 @@ fn eval_statement(env: Env, stmt: Statement) -> EvalResult {
           }
         }
       }
+    EnvAssign(name, pipeline) ->
+      case eval_pipeline(env, pipeline, Nothing) {
+        Quit(code) -> Quit(code)
+        Continue(env2, value) ->
+          case value {
+            Fail(_) -> Continue(env2, value)
+            _ ->
+              case env.set_os_env(env2, name, value) {
+                Ok(env3) -> Continue(env.set_exit(env3, 0), value)
+                Error(msg) ->
+                  Continue(env.set_exit(env2, 1), Fail(msg))
+              }
+          }
+      }
     parser.Expr(pipeline) -> eval_pipeline(env, pipeline, Nothing)
   }
 }
@@ -64,6 +80,15 @@ fn eval_pipeline(env: Env, pipeline: Pipeline, input: Value) -> EvalResult {
 
 fn eval_command(env: Env, cmd: Command, input: Value) -> EvalResult {
   case cmd {
+    // Bare value stage produced by the parser for `$env`, `$x`, literals, …
+    parser.Command("__value__", [ValueArg(expr)], False) -> {
+      sys.clear_output_shown()
+      let env = env.set_input(env, input)
+      case eval_expr(env, expr) {
+        Ok(v) -> Continue(env.set_exit(env, 0), v)
+        Error(msg) -> Continue(env.set_exit(env, 1), Fail(msg))
+      }
+    }
     parser.Command(name, args, external) -> {
       let env = env.set_input(env, input)
       case eval_args(env, args) {
@@ -71,7 +96,9 @@ fn eval_command(env: Env, cmd: Command, input: Value) -> EvalResult {
         Ok(#(pos, flags)) -> {
           case external {
             True -> run_external(env, name, pos)
-            False ->
+            False -> {
+              // Builtins produce a new value that was not streamed to the TTY.
+              sys.clear_output_shown()
               case resolve_builtin(name, pos) {
                 Ok(#(builtin, pos2)) ->
                   case builtin(env, input, pos2, flags) {
@@ -84,8 +111,10 @@ fn eval_command(env: Env, cmd: Command, input: Value) -> EvalResult {
                       Continue(env2, value)
                     }
                   }
+                // Unknown name → external binary (may set output_shown).
                 Error(Nil) -> run_external(env, name, pos)
               }
+            }
           }
         }
       }

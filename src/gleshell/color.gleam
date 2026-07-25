@@ -41,6 +41,21 @@ const dim = "\u{001b}[2m"
 /// Bold — emphasis (prompt name).
 const bold = "\u{001b}[1m"
 
+/// Yellow — operators (Nu `shape_operator`).
+const yellow = "\u{001b}[33m"
+
+/// Bold cyan — internal commands / lists / records (Nu `shape_internalcall`).
+const bold_cyan = "\u{001b}[1;36m"
+
+/// Bold blue — flags (Nu `shape_flag`).
+const bold_blue = "\u{001b}[1;34m"
+
+/// Bold purple — ints, floats, pipes (Nu `shape_int` / `shape_pipe`).
+const bold_purple = "\u{001b}[1;35m"
+
+/// White on red — garbage / lex errors (Nu `shape_garbage`).
+const garbage = "\u{001b}[1;37;41m"
+
 /// Whether ANSI color should be emitted.
 ///
 /// - Off when `NO_COLOR` is set to a non-empty value (https://no-color.org).
@@ -163,6 +178,76 @@ pub fn prompt_path(on: Bool, text: String) -> String {
 
 pub fn prompt_mark(on: Bool, text: String) -> String {
   paint(on, bold, text)
+}
+
+// --- syntax shapes (Nushell `shape_*` defaults) ---
+
+pub fn shape_internalcall(on: Bool, text: String) -> String {
+  paint(on, bold_cyan, text)
+}
+
+pub fn shape_external(on: Bool, text: String) -> String {
+  paint(on, cyan, text)
+}
+
+pub fn shape_externalarg(on: Bool, text: String) -> String {
+  paint(on, bold_green, text)
+}
+
+pub fn shape_string(on: Bool, text: String) -> String {
+  paint(on, green, text)
+}
+
+pub fn shape_int(on: Bool, text: String) -> String {
+  paint(on, bold_purple, text)
+}
+
+pub fn shape_float(on: Bool, text: String) -> String {
+  paint(on, bold_purple, text)
+}
+
+pub fn shape_bool(on: Bool, text: String) -> String {
+  paint(on, light_cyan, text)
+}
+
+pub fn shape_nothing(on: Bool, text: String) -> String {
+  paint(on, light_cyan, text)
+}
+
+pub fn shape_flag(on: Bool, text: String) -> String {
+  paint(on, bold_blue, text)
+}
+
+pub fn shape_pipe(on: Bool, text: String) -> String {
+  paint(on, bold_purple, text)
+}
+
+pub fn shape_operator(on: Bool, text: String) -> String {
+  paint(on, yellow, text)
+}
+
+pub fn shape_variable(on: Bool, text: String) -> String {
+  paint(on, purple, text)
+}
+
+pub fn shape_list(on: Bool, text: String) -> String {
+  paint(on, bold_cyan, text)
+}
+
+pub fn shape_record(on: Bool, text: String) -> String {
+  paint(on, bold_cyan, text)
+}
+
+pub fn shape_comment(on: Bool, text: String) -> String {
+  paint(on, dark_gray, text)
+}
+
+pub fn shape_keyword(on: Bool, text: String) -> String {
+  paint(on, bold_cyan, text)
+}
+
+pub fn shape_garbage(on: Bool, text: String) -> String {
+  paint(on, garbage, text)
 }
 
 /// Visible length ignoring ANSI CSI sequences (`ESC [ … final`).

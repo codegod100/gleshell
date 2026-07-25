@@ -27,7 +27,7 @@ pub fn main() -> Nil {
 }
 
 fn print_usage() -> Nil {
-  io.println(string.join(
+  sys.println(string.join(
     [
       "gleshell — Gleam shell inspired by Nushell",
       "",
@@ -62,8 +62,8 @@ fn run_once(code: String) -> Nil {
 }
 
 fn repl(env: env.Env) -> Nil {
-  io.println(
-    "gleshell 0.1 — structured data shell (type `help`, `exit` to quit; Ctrl+R reverse search)",
+  sys.println(
+    "gleshell 0.1 — structured data shell (type `help`, `exit` to quit; Tab completes paths, Ctrl+R search)",
   )
   repl_loop(env)
 }
@@ -72,8 +72,13 @@ fn repl_loop(env: env.Env) -> Nil {
   let prompt = prompt_for(env)
   case sys.get_line(prompt) {
     Error("eof") -> {
-      io.println("")
+      sys.println("")
       Nil
+    }
+    // Ctrl+C cancelled the line (edlin path); stay in the REPL.
+    Error("interrupted") -> {
+      sys.println("")
+      repl_loop(env)
     }
     Error(e) -> {
       io.println_error("read error: " <> e)
@@ -140,13 +145,20 @@ fn list_last(items: List(String)) -> String {
 fn print_value(value: value.Value) -> Nil {
   case value {
     Nothing -> Nil
-    _ -> {
-      let text = display.render(value)
-      case text {
-        "" -> Nil
-        t -> io.println(t)
+    _ ->
+      // External commands that used PTY relay already streamed output to the
+      // terminal (needed for run0/sudo password prompts). Skip re-printing
+      // when that flag is still set (final pipeline stage was that external).
+      case sys.take_output_shown() {
+        True -> Nil
+        False -> {
+          let text = display.render(value)
+          case text {
+            "" -> Nil
+            t -> sys.println(t)
+          }
+        }
       }
-    }
   }
 }
 

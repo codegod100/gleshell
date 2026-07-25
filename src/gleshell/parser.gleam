@@ -17,6 +17,8 @@ pub type ParseError {
 pub type Statement {
   /// `let name = pipeline`
   Let(name: String, pipeline: Pipeline)
+  /// `$env.NAME = pipeline` — set a process environment variable
+  EnvAssign(name: String, pipeline: Pipeline)
   /// Bare pipeline expression
   Expr(pipeline: Pipeline)
 }
@@ -112,6 +114,27 @@ fn parse_statement(
       use #(pipe, rest2) <- result_try(parse_pipeline(rest))
       Ok(#(Let(name, pipe), rest2))
     }
+    // `$env.NAME = …` (Nushell-style process env assignment)
+    [Dollar, Ident(name), Assign, ..rest] ->
+      case string.starts_with(name, "env.") {
+        True -> {
+          let key = string.drop_start(name, 4)
+          case key {
+            "" ->
+              Error(ParseError(
+                "expected environment variable name after $env.",
+              ))
+            _ -> {
+              use #(pipe, rest2) <- result_try(parse_assign_rhs(rest))
+              Ok(#(EnvAssign(key, pipe), rest2))
+            }
+          }
+        }
+        False ->
+          Error(ParseError(
+            "only `$env.NAME = …` assignment is supported (use `let name = …` for shell vars)",
+          ))
+      }
     _ -> {
       use #(pipe, rest) <- result_try(parse_pipeline(tokens))
       Ok(#(Expr(pipe), rest))
@@ -126,6 +149,30 @@ fn result_try(
   case r {
     Ok(v) -> f(v)
     Error(e) -> Error(e)
+  }
+}
+
+/// RHS of `$env.NAME = …`: a single expression becomes a value stage so bare
+/// words are strings (`$env.FOO = hello`); otherwise a full pipeline
+/// (`$env.FOO = range 3`, `$env.FOO = echo hi`).
+fn parse_assign_rhs(
+  tokens: List(Token),
+) -> Result(#(Pipeline, List(Token)), ParseError) {
+  case is_expr_start(tokens) {
+    True ->
+      case parse_expr(tokens) {
+        Ok(#(expr, rest)) ->
+          case rest {
+            [] | [Eof] ->
+              Ok(#(
+                Pipeline([Command("__value__", [ValueArg(expr)], False)]),
+                rest,
+              ))
+            _ -> parse_pipeline(tokens)
+          }
+        Error(_) -> parse_pipeline(tokens)
+      }
+    False -> parse_pipeline(tokens)
   }
 }
 
@@ -164,6 +211,18 @@ fn parse_command(
     [StringLit(s), ..rest] -> {
       use #(args, rest2) <- result_try(parse_args(rest, []))
       Ok(#(Command(s, args, False), rest2))
+    }
+    // Bare value as pipeline stage: `$env`, `$x`, `[1 2]`, `{a: 1}`, …
+    // Becomes internal `__value__` that yields the expression.
+    [Dollar, ..]
+    | [LBracket, ..]
+    | [LBrace, ..]
+    | [IntLit(_), ..]
+    | [FloatLit(_), ..]
+    | [BoolLit(_), ..]
+    | [NothingLit, ..] -> {
+      use #(expr, rest) <- result_try(parse_expr(tokens))
+      Ok(#(Command("__value__", [ValueArg(expr)], False), rest))
     }
     [] | [Eof] -> Error(ParseError("expected command"))
     _ -> Error(ParseError("expected command name"))

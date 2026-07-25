@@ -51,6 +51,8 @@
                 fi
               fi
               cd "$root"
+              # +Bc: Ctrl+C cancels the line; do not open the Erlang BREAK/abort menu.
+              export ERL_AFLAGS="+Bc ''${ERL_AFLAGS:-}"
               exec gleam run -- "$@"
             '';
           };
@@ -74,14 +76,11 @@
           pkgs = nixpkgs.legacyPackages.${system};
         in
         {
+          # --no-pure-eval (or direnv) is required so devenv can resolve
+          # devenv.root from $PWD; pure eval would point ./. at the store.
           default = devenv.lib.mkShell {
             inherit inputs pkgs;
-            modules = [
-              {
-                devenv.root = builtins.toString ./.;
-              }
-              ./devenv.nix
-            ];
+            modules = [ ./devenv.nix ];
           };
         }
       );

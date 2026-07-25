@@ -4,8 +4,10 @@ import gleshell/color
 import gleshell/display
 import gleshell/env
 import gleshell/eval
+import gleshell/highlight
 import gleshell/lexer
 import gleshell/parser
+import gleshell/sys
 import gleshell/value.{Bool, Int, List, Nothing, Record, String, Table}
 
 pub fn main() -> Nil {
@@ -118,6 +120,62 @@ pub fn eval_let_and_var_test() {
   Nil
 }
 
+pub fn eval_env_var_get_test() {
+  // `$env.HOME` and bare `$env.HOME` as pipeline source
+  let env = env.new()
+  let assert Ok(home) = sys.getenv("HOME")
+  let assert eval.Continue(_, String(got)) =
+    eval.eval_source(env, "echo $env.HOME")
+  let assert True = got == home
+  let assert eval.Continue(_, String(got2)) = eval.eval_source(env, "$env.HOME")
+  let assert True = got2 == home
+  Nil
+}
+
+pub fn eval_env_record_test() {
+  let env = env.new()
+  let assert eval.Continue(_, Record(fields)) = eval.eval_source(env, "$env")
+  let assert True = list_has_string_field(fields, "HOME")
+  let assert True = list_has_string_field(fields, "PATH")
+  // `$env | get HOME`
+  let assert eval.Continue(_, String(home)) =
+    eval.eval_source(env, "$env | get HOME")
+  let assert True = string.length(home) > 0
+  Nil
+}
+
+pub fn eval_env_assign_test() {
+  let env = env.new()
+  let assert eval.Continue(env2, String("gleshell-test-val")) =
+    eval.eval_source(env, "$env.GLESHELL_TEST_VAR = gleshell-test-val")
+  let assert eval.Continue(_, String("gleshell-test-val")) =
+    eval.eval_source(env2, "$env.GLESHELL_TEST_VAR")
+  let assert Ok("gleshell-test-val") = sys.getenv("GLESHELL_TEST_VAR")
+  Nil
+}
+
+pub fn parse_env_assign_test() {
+  let assert Ok(parser.EnvAssign("FOO", parser.Pipeline([cmd]))) =
+    parser.parse("$env.FOO = hello")
+  let assert parser.Command(
+    "__value__",
+    [parser.ValueArg(parser.Lit(String("hello")))],
+    False,
+  ) = cmd
+  Nil
+}
+
+fn list_has_string_field(
+  fields: List(#(String, value.Value)),
+  key: String,
+) -> Bool {
+  case fields {
+    [] -> False
+    [#(k, String(_)), ..] if k == key -> True
+    [_, ..rest] -> list_has_string_field(rest, key)
+  }
+}
+
 pub fn eval_where_select_test() {
   let env = env.new()
   // build table via records in a list, convert with table
@@ -223,6 +281,60 @@ pub fn color_visible_length_strips_ansi_test() {
   let painted = color.paint(True, "\u{001b}[32m", "hi")
   let assert 2 = color.visible_length(painted)
   let assert 2 = color.visible_length("hi")
+  Nil
+}
+
+// --- input syntax highlighting ---
+
+pub fn highlight_plain_when_off_test() {
+  let src = "ls | where type == file"
+  let assert True = highlight.highlight(False, src) == src
+  Nil
+}
+
+pub fn highlight_pipeline_has_shapes_test() {
+  let text = highlight.highlight(True, "ls | first 3")
+  // bold cyan internalcall, bold purple pipe, bold purple int
+  let assert True = string_contains(text, "\u{001b}[1;36m")
+  let assert True = string_contains(text, "\u{001b}[1;35m")
+  let assert True = string_contains(text, "ls")
+  let assert True = string_contains(text, "first")
+  let assert True = string_contains(text, "3")
+  // visible text unchanged
+  let assert 12 = color.visible_length(text)
+  Nil
+}
+
+pub fn highlight_string_and_flag_test() {
+  let text = highlight.highlight(True, "echo \"hi\" --raw")
+  let assert True = string_contains(text, "\u{001b}[32m")
+  let assert True = string_contains(text, "\u{001b}[1;34m")
+  let assert True = string_contains(text, "hi")
+  let assert True = string_contains(text, "--raw")
+  Nil
+}
+
+pub fn highlight_variable_and_let_test() {
+  let text = highlight.highlight(True, "let x = $in")
+  let assert True = string_contains(text, "\u{001b}[1;36m")
+  let assert True = string_contains(text, "\u{001b}[35m")
+  let assert True = string_contains(text, "let")
+  let assert True = string_contains(text, "$in")
+  Nil
+}
+
+pub fn highlight_incomplete_string_test() {
+  // Unterminated string while typing should not crash
+  let text = highlight.highlight(True, "echo \"hel")
+  let assert True = string_contains(text, "hel")
+  let assert True = string_contains(text, "\u{001b}[32m")
+  Nil
+}
+
+pub fn highlight_to_json_multiword_test() {
+  let text = highlight.highlight(True, "range 3 | to json")
+  let assert True = string_contains(text, "to json")
+  let assert True = string_contains(text, "\u{001b}[1;36m")
   Nil
 }
 
