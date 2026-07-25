@@ -243,7 +243,8 @@ fn is_digit(c: String) -> Bool {
 
 fn is_ident_start(c: String) -> Bool {
   case c {
-    "_" -> True
+    // Paths: `.jj`, `..`, `./src`, `/tmp`, `~/code`
+    "_" | "." | "/" | "~" -> True
     _ -> {
       let lower = string.lowercase(c)
       case lower {
@@ -280,5 +281,6 @@ fn is_ident_start(c: String) -> Bool {
 }
 
 fn is_ident_continue(c: String) -> Bool {
-  is_ident_start(c) || is_digit(c) || c == "-" || c == "." || c == "/"
+  // Path-ish chars: letters/digits already covered; keep `.` `/` `-` `~` mid-token.
+  is_ident_start(c) || is_digit(c) || c == "-"
 }

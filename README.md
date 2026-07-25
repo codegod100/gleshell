@@ -42,7 +42,7 @@ green, numbers purple, pipes purple, flags blue, variables purple, …).
 |-----|--------|
 | ↑ / ↓ | History |
 | **Tab** | Filename completion (common prefix; list matches if ambiguous) |
-| **Ctrl+R** | Reverse-i-search through history |
+| **Ctrl+R** | Reverse-i-search through history (Enter accepts onto the line) |
 | Ctrl+A / Ctrl+E | Beginning / end of line |
 | Ctrl+W | Delete previous word |
 | Ctrl+U / Ctrl+K | Kill to start / end of line |
@@ -82,6 +82,7 @@ echo $env.MY_VAR
 # external programs (stdout captured as a string)
 ^uname -a
 which ls
+which -a ls
 ```
 
 ## Language sketch
@@ -130,6 +131,10 @@ src/
 
 Input and output are colorized on a TTY (Nu-like shapes on the command line;
 headers bold green, numbers purple, bools cyan, dirs blue, errors red, …).
+External tools (`jj`, `git`, …) keep their own colors: final-stage commands
+inherit the real TTY (or get `FORCE_COLOR` when output is captured), and
+pre-colored text is not re-painted by the shell. Paginated output gets
+`LESS=FRX` when unset so `less` passes ANSI through.
 Disable with `NO_COLOR=1`; force with `FORCE_COLOR=1`.
 
 ## Status

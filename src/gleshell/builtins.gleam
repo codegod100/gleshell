@@ -165,6 +165,10 @@ fn help_text() -> dict.Dict(String, String) {
       "env [NAME] — process environment table, or one var (same as `$env` / `$env.NAME`)",
     ),
     #("sys", "sys — host info record"),
+    #(
+      "which",
+      "which [-a|--all] <name> — path of command (builtin or on PATH); -a lists all matches",
+    ),
   ])
 }
 
@@ -1002,19 +1006,53 @@ fn cmd_which(
   env: Env,
   _input: Value,
   args: List(Value),
-  _flags: dict.Dict(String, Value),
+  flags: dict.Dict(String, Value),
 ) -> BuiltinResult {
-  case args {
-    [String(name)] ->
-      case dict.has_key(registry(), name) {
-        True -> ok(env, String("builtin: " <> name))
+  // `which -a name` is parsed as FlagArg("a", Some("name")) because the
+  // generic flag parser attaches the next expression as a flag value.
+  // Accept both `which -a name` and `which name -a` / `which --all name`.
+  let #(all, name_opt) = case args {
+    [String(n)] -> #(
+      flag_set(flags, "a") || flag_set(flags, "all"),
+      option.Some(n),
+    )
+    [] ->
+      case dict.get(flags, "a"), dict.get(flags, "all") {
+        Ok(String(n)), _ -> #(True, option.Some(n))
+        _, Ok(String(n)) -> #(True, option.Some(n))
+        Ok(Bool(True)), _ | _, Ok(Bool(True)) -> #(True, option.None)
+        _, _ -> #(False, option.None)
+      }
+    _ -> #(False, option.None)
+  }
+  case name_opt {
+    option.Some(name) -> {
+      let is_builtin = dict.has_key(registry(), name)
+      case all {
+        True -> {
+          let paths = list.map(sys.which_all(name), String)
+          let matches = case is_builtin {
+            True -> [String("builtin: " <> name), ..paths]
+            False -> paths
+          }
+          case matches {
+            [] -> err(env, "which: " <> name <> " not found")
+            [one] -> ok(env, one)
+            many -> ok(env, List(many))
+          }
+        }
         False ->
-          case sys.which(name) {
-            Ok(path) -> ok(env, String(path))
-            Error(Nil) -> err(env, "which: " <> name <> " not found")
+          case is_builtin {
+            True -> ok(env, String("builtin: " <> name))
+            False ->
+              case sys.which(name) {
+                Ok(path) -> ok(env, String(path))
+                Error(Nil) -> err(env, "which: " <> name <> " not found")
+              }
           }
       }
-    _ -> err(env, "which: expected name")
+    }
+    option.None -> err(env, "which: expected name (try `which [-a] <name>`)")
   }
 }
 

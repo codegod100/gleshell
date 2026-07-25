@@ -34,8 +34,9 @@ pub fn eval_source(env: Env, source: String) -> EvalResult {
 
 fn eval_statement(env: Env, stmt: Statement) -> EvalResult {
   case stmt {
+    // Assignments always capture external output into a value.
     Let(name, pipeline) ->
-      case eval_pipeline(env, pipeline, Nothing) {
+      case eval_pipeline(env, pipeline, Nothing, False) {
         Quit(code) -> Quit(code)
         Continue(env2, value) -> {
           case value {
@@ -45,7 +46,7 @@ fn eval_statement(env: Env, stmt: Statement) -> EvalResult {
         }
       }
     EnvAssign(name, pipeline) ->
-      case eval_pipeline(env, pipeline, Nothing) {
+      case eval_pipeline(env, pipeline, Nothing, False) {
         Quit(code) -> Quit(code)
         Continue(env2, value) ->
           case value {
@@ -58,27 +59,45 @@ fn eval_statement(env: Env, stmt: Statement) -> EvalResult {
               }
           }
       }
-    parser.Expr(pipeline) -> eval_pipeline(env, pipeline, Nothing)
+    // Bare expression: last external may take the real TTY (less, vim, …).
+    parser.Expr(pipeline) -> eval_pipeline(env, pipeline, Nothing, True)
   }
 }
 
-fn eval_pipeline(env: Env, pipeline: Pipeline, input: Value) -> EvalResult {
+/// `allow_tty` — when True, the last pipeline stage may run as a foreground
+/// interactive process on the real terminal (needed for `less`, `vim`, etc.).
+fn eval_pipeline(
+  env: Env,
+  pipeline: Pipeline,
+  input: Value,
+  allow_tty: Bool,
+) -> EvalResult {
   case pipeline {
-    parser.Pipeline(commands) ->
-      list.fold(commands, Continue(env, input), fn(acc, cmd) {
+    parser.Pipeline(commands) -> {
+      let total = list.length(commands)
+      list.index_fold(commands, Continue(env, input), fn(acc, cmd, index) {
         case acc {
           Quit(code) -> Quit(code)
           Continue(env2, value) ->
             case value {
               Fail(_) -> Continue(env2, value)
-              _ -> eval_command(env2, cmd, value)
+              _ -> {
+                let is_last = index + 1 == total
+                eval_command(env2, cmd, value, allow_tty && is_last)
+              }
             }
         }
       })
+    }
   }
 }
 
-fn eval_command(env: Env, cmd: Command, input: Value) -> EvalResult {
+fn eval_command(
+  env: Env,
+  cmd: Command,
+  input: Value,
+  interactive: Bool,
+) -> EvalResult {
   case cmd {
     // Bare value stage produced by the parser for `$env`, `$x`, literals, …
     parser.Command("__value__", [ValueArg(expr)], False) -> {
@@ -91,12 +110,18 @@ fn eval_command(env: Env, cmd: Command, input: Value) -> EvalResult {
     }
     parser.Command(name, args, external) -> {
       let env = env.set_input(env, input)
-      case eval_args(env, args) {
-        Error(msg) -> Continue(env.set_exit(env, 1), Fail(msg))
-        Ok(#(pos, flags)) -> {
-          case external {
-            True -> run_external(env, name, pos)
-            False -> {
+      case external {
+        // Externals: keep argv order exactly as written (`jj log -n 1`, not
+        // `-n 1 log`). Flag-first reordering is only for builtins.
+        True ->
+          case eval_argv(env, args) {
+            Error(msg) -> Continue(env.set_exit(env, 1), Fail(msg))
+            Ok(str_args) -> run_external(env, name, str_args, interactive)
+          }
+        False ->
+          case eval_args(env, args) {
+            Error(msg) -> Continue(env.set_exit(env, 1), Fail(msg))
+            Ok(#(pos, flags)) -> {
               // Builtins produce a new value that was not streamed to the TTY.
               sys.clear_output_shown()
               case resolve_builtin(name, pos) {
@@ -111,12 +136,16 @@ fn eval_command(env: Env, cmd: Command, input: Value) -> EvalResult {
                       Continue(env2, value)
                     }
                   }
-                // Unknown name → external binary (may set output_shown).
-                Error(Nil) -> run_external(env, name, pos)
+                // Unknown name → external binary (preserve order).
+                Error(Nil) ->
+                  case eval_argv(env, args) {
+                    Error(msg) -> Continue(env.set_exit(env, 1), Fail(msg))
+                    Ok(str_args) ->
+                      run_external(env, name, str_args, interactive)
+                  }
               }
             }
           }
-        }
       }
     }
   }
@@ -165,6 +194,42 @@ fn eval_args(
   })
 }
 
+/// Flatten command args to an argv for external programs, preserving order.
+fn eval_argv(env: Env, args: List(Arg)) -> Result(List(String), String) {
+  list.try_fold(args, [], fn(acc, arg) {
+    case arg {
+      ValueArg(expr) ->
+        case eval_expr(env, expr) {
+          Ok(v) -> Ok(list.append(acc, [value.as_string(v)]))
+          Error(e) -> Error(e)
+        }
+      FlagArg(name, parser.None) -> {
+        let flag = format_flag_name(name)
+        Ok(list.append(acc, [flag]))
+      }
+      FlagArg(name, parser.Some(expr)) ->
+        case eval_expr(env, expr) {
+          Ok(v) -> {
+            let flag = format_flag_name(name)
+            Ok(list.append(acc, [flag, value.as_string(v)]))
+          }
+          Error(e) -> Error(e)
+        }
+    }
+  })
+}
+
+fn format_flag_name(name: String) -> String {
+  case string.starts_with(name, "-") {
+    True -> name
+    False ->
+      case string.length(name) {
+        1 -> "-" <> name
+        _ -> "--" <> name
+      }
+  }
+}
+
 fn eval_expr(env: Env, expr: Expr) -> Result(Value, String) {
   case expr {
     Lit(v) -> Ok(v)
@@ -192,9 +257,17 @@ fn eval_expr(env: Env, expr: Expr) -> Result(Value, String) {
   }
 }
 
-fn run_external(env: Env, name: String, args: List(Value)) -> EvalResult {
-  let str_args = list.map(args, value.as_string)
-  case sys.run_cmd(name, str_args) {
+fn run_external(
+  env: Env,
+  name: String,
+  str_args: List(String),
+  interactive: Bool,
+) -> EvalResult {
+  let result = case interactive {
+    True -> sys.run_cmd_tty(name, str_args)
+    False -> sys.run_cmd(name, str_args)
+  }
+  case result {
     Error(msg) -> Continue(env.set_exit(env, 127), Fail(msg))
     Ok(#(status, output)) -> {
       let output = string.trim_end(output)

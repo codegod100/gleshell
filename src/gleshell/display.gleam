@@ -17,6 +17,9 @@ pub fn render_with(on: Bool, value: Value) -> String {
   case value {
     Nothing -> ""
     Fail(msg) -> color.error(on, "Error: " <> msg)
+    // Opaque text from external tools (jj, git, …): keep their ANSI as-is.
+    // Multi-line output is almost always command text — do not paint it green.
+    String(s) -> render_string(on, s)
     Table(cols, rows) -> render_table_with(on, cols, rows)
     List(items) -> {
       case list.all(items, is_record) {
@@ -30,6 +33,15 @@ pub fn render_with(on: Bool, value: Value) -> String {
     }
     Record(fields) -> render_record(on, fields)
     other -> color_cell(on, "", other, value.cell_string(other))
+  }
+}
+
+/// External programs often embed their own colors. Pass those through.
+/// Short plain strings still get Nu-style string coloring.
+fn render_string(on: Bool, s: String) -> String {
+  case color.contains_ansi(s) || string.contains(s, "\n") {
+    True -> s
+    False -> color.string_(on, s)
   }
 }
 
@@ -111,14 +123,16 @@ fn render_table_with(
       let plain_cells: List(List(String)) =
         list.map(rows, fn(row) { list.map(row, value.cell_string) })
 
+      // Widths use visible length so cells with ANSI (from external tools)
+      // do not inflate the table.
       let widths =
         list.index_map(columns, fn(col, i) {
-          let header_w = string.length(col)
+          let header_w = color.visible_length(col)
           let data_w =
             plain_cells
             |> list.map(fn(row) {
               case list_at(row, i) {
-                Ok(c) -> string.length(c)
+                Ok(c) -> color.visible_length(c)
                 Error(Nil) -> 0
               }
             })
@@ -183,7 +197,8 @@ fn colored_data_line(
       // Color the unpadded text, then add trailing spaces outside ANSI codes
       // so type/name matchers see exact values ("dir", not "dir ").
       let painted = color_cell_for_column(on, col, val, plain, type_hint)
-      let pad = string.repeat(" ", int.max(0, w - string.length(plain)))
+      let pad =
+        string.repeat(" ", int.max(0, w - color.visible_length(plain)))
       " " <> painted <> pad <> " "
     })
   // Extra empty columns if widths longer than columns (shouldn't happen).
@@ -275,7 +290,12 @@ fn color_by_value(on: Bool, value: Value, plain: String) -> String {
     Bool(_) -> color.bool_(on, plain)
     Int(_) -> color.int_(on, plain)
     Float(_) -> color.float_(on, plain)
-    String(_) -> color.string_(on, plain)
+    // Preserve pre-colored external text inside tables/lists/records.
+    String(_) ->
+      case color.contains_ansi(plain) {
+        True -> plain
+        False -> color.string_(on, plain)
+      }
     Fail(_) -> color.error(on, plain)
     List(_) | Record(_) | Table(_, _) -> color.string_(on, plain)
   }

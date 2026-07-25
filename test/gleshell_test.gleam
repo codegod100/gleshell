@@ -35,6 +35,30 @@ pub fn lexer_string_and_number_test() {
   Nil
 }
 
+pub fn lexer_path_idents_test() {
+  // Dotfiles, relative/absolute paths, home — must be bare words for `ls .jj` etc.
+  let assert Ok(tokens) = lexer.tokenize("ls .jj ./src ../foo /tmp ~ ~/code")
+  let assert [
+    lexer.Ident("ls"),
+    lexer.Ident(".jj"),
+    lexer.Ident("./src"),
+    lexer.Ident("../foo"),
+    lexer.Ident("/tmp"),
+    lexer.Ident("~"),
+    lexer.Ident("~/code"),
+    lexer.Eof,
+  ] = tokens
+  Nil
+}
+
+pub fn parse_ls_dotfile_test() {
+  let assert Ok(parser.Expr(parser.Pipeline([
+    parser.Command("ls", args, False),
+  ]))) = parser.parse("ls .jj")
+  let assert [parser.ValueArg(parser.Lit(String(".jj")))] = args
+  Nil
+}
+
 // --- parser ---
 
 pub fn parse_pipeline_test() {
@@ -242,6 +266,35 @@ pub fn eval_length_test() {
   Nil
 }
 
+pub fn eval_which_builtin_test() {
+  let env = env.new()
+  let assert eval.Continue(_, String("builtin: ls")) =
+    eval.eval_source(env, "which ls")
+  Nil
+}
+
+pub fn eval_which_all_test() {
+  let env = env.new()
+  // `-a` includes the builtin first, then any PATH copies of `ls`.
+  let assert eval.Continue(_, result) = eval.eval_source(env, "which -a ls")
+  case result {
+    String("builtin: ls") -> Nil
+    List([String("builtin: ls"), ..]) -> Nil
+    other -> {
+      let _ = other
+      panic as "which -a ls should start with builtin: ls"
+    }
+  }
+}
+
+pub fn eval_which_external_test() {
+  let env = env.new()
+  // `sh` is not a gleshell builtin; should resolve via PATH.
+  let assert eval.Continue(_, String(path)) = eval.eval_source(env, "which sh")
+  let assert True = string.contains(path, "sh")
+  Nil
+}
+
 pub fn value_nothing_falsey_test() {
   let assert False = value.is_truthy(Nothing)
   let assert True = value.is_truthy(Int(1))
@@ -261,6 +314,21 @@ pub fn display_colored_has_ansi_test() {
   let text = display.render_with(True, Bool(True))
   let assert True = string_contains(text, "\u{001b}")
   let assert True = string_contains(text, "true")
+  Nil
+}
+
+pub fn display_preserves_external_ansi_test() {
+  // Pre-colored tool output (jj, git, …) must not be re-wrapped in string green.
+  let app = "\u{001b}[1;31merror\u{001b}[0m: boom"
+  let text = display.render_with(True, String(app))
+  let assert True = text == app
+  Nil
+}
+
+pub fn display_multiline_string_not_recolored_test() {
+  let multi = "line1\nline2"
+  let text = display.render_with(True, String(multi))
+  let assert True = text == multi
   Nil
 }
 
@@ -335,6 +403,16 @@ pub fn highlight_to_json_multiword_test() {
   let text = highlight.highlight(True, "range 3 | to json")
   let assert True = string_contains(text, "to json")
   let assert True = string_contains(text, "\u{001b}[1;36m")
+  Nil
+}
+
+pub fn highlight_path_arg_not_garbage_test() {
+  // Dotfile paths must not use shape_garbage (white-on-red)
+  let text = highlight.highlight(True, "ls .jj ./src /tmp ~/code")
+  let assert True = string_contains(text, ".jj")
+  let assert False = string_contains(text, "\u{001b}[1;37;41m")
+  // args use shape_externalarg (bold green)
+  let assert True = string_contains(text, "\u{001b}[1;32m")
   Nil
 }
 

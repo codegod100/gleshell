@@ -1,5 +1,6 @@
 %% Erlang FFI for gleshell: REPL I/O, cwd, env, external processes.
 -module(gleshell_ffi).
+-include_lib("kernel/include/file.hrl").
 -export([
     get_line/1,
     parse_line/2,
@@ -11,7 +12,9 @@
     setenv/2,
     list_env/0,
     run_cmd/2,
+    run_cmd_tty/2,
     which/1,
+    which_all/1,
     home_dir/0,
     stdout_isatty/0,
     println/1,
@@ -652,10 +655,11 @@ reverse_search_loop(Prompt, History, Query, Match) ->
             io:put_chars("\r\n"),
             {error, <<"eof">>};
         enter ->
+            %% Accept match onto the edit line; do not submit (edit first).
             Line = iolist_to_binary(Match),
-            io:put_chars("\r\n"),
-            push_history(Line),
-            {ok, Line};
+            {L, R} = bin_to_buffer(Line),
+            redraw(Prompt, L, R),
+            raw_loop(Prompt, L, R, History, 0, <<>>);
         ctrl_c ->
             io:put_chars("\r\n"),
             redraw(Prompt, [], []),
@@ -998,11 +1002,75 @@ list_env() ->
 
 -spec which(binary()) -> {ok, binary()} | {error, nil}.
 which(Command) when is_binary(Command) ->
-    case os:find_executable(unicode:characters_to_list(Command)) of
+    case which_all(Command) of
+        [Path | _] ->
+            {ok, Path};
+        [] ->
+            {error, nil}
+    end.
+
+%% All matching executables on PATH (or the path itself if absolute/relative).
+%% Order matches PATH search; duplicates from the same resolved path are dropped.
+-spec which_all(binary()) -> [binary()].
+which_all(Command) when is_binary(Command) ->
+    Cmd = unicode:characters_to_list(Command),
+    case Cmd of
+        [] ->
+            [];
+        _ ->
+            case has_path_sep(Cmd) of
+                true ->
+                    case is_executable_file(Cmd) of
+                        true ->
+                            [unicode:characters_to_binary(filename:absname(Cmd))];
+                        false ->
+                            []
+                    end;
+                false ->
+                    case os:getenv("PATH") of
+                        false ->
+                            [];
+                        PathStr ->
+                            Dirs = string:tokens(PathStr, path_sep()),
+                            find_all_in_path(Cmd, Dirs, #{}, [])
+                    end
+            end
+    end.
+
+path_sep() ->
+    case os:type() of
+        {win32, _} -> ";";
+        _ -> ":"
+    end.
+
+has_path_sep(Cmd) ->
+    lists:member($/, Cmd) orelse lists:member($\\, Cmd).
+
+find_all_in_path(_Cmd, [], _Seen, Acc) ->
+    lists:reverse(Acc);
+find_all_in_path(Cmd, [Dir | Rest], Seen, Acc) ->
+    File = filename:join(Dir, Cmd),
+    case is_executable_file(File) of
+        true ->
+            Abs = filename:absname(File),
+            Bin = unicode:characters_to_binary(Abs),
+            case maps:is_key(Abs, Seen) of
+                true ->
+                    find_all_in_path(Cmd, Rest, Seen, Acc);
+                false ->
+                    find_all_in_path(Cmd, Rest, Seen#{Abs => true}, [Bin | Acc])
+            end;
         false ->
-            {error, nil};
-        Path ->
-            {ok, unicode:characters_to_binary(Path)}
+            find_all_in_path(Cmd, Rest, Seen, Acc)
+    end.
+
+is_executable_file(Path) ->
+    case file:read_file_info(Path) of
+        {ok, #file_info{type = regular, mode = Mode}} ->
+            %% Any execute bit (owner/group/other).
+            (Mode band 8#111) =/= 0;
+        _ ->
+            false
     end.
 
 -spec home_dir() -> {ok, binary()} | {error, binary()}.
@@ -1034,28 +1102,55 @@ stdout_isatty() ->
 %% ---------------------------------------------------------------------------
 %% External commands
 %%
-%% Erlang's erl_child_setup detaches from the controlling TTY, so tools that
-%% need interactive auth (run0, sudo, pkexec, polkit/pkttyagent) fail with:
-%%   "interactive authentication has not been enabled by the calling program"
+%% Two modes:
 %%
-%% When a TTY is available and util-linux `script` is on PATH, we allocate a
-%% PTY for the child and relay bytes between that session and the real
-%% terminal so password prompts work. Output is still captured for pipelines.
+%% 1. `run_cmd/2` — capture stdout/stderr into a binary (pipelines, `let x =`,
+%%    non-TTY). Uses pipes; the child does NOT get a real terminal.
+%%
+%% 2. `run_cmd_tty/2` — foreground interactive. The child inherits the real
+%%    stdio FDs (`nouse_stdio`) so pagers (`less`), editors (`vim`), and most
+%%    TUI tools work. BEAM only waits on exit status; keys go straight to the
+%%    child (no broken PTY byte-relay).
+%%
+%% Auth tools (`sudo`, `run0`, …) need a *controlling* TTY; erl_child_setup
+%% calls setsid, so plain inherit is not enough. For those we wrap with
+%% util-linux `script` to allocate a PTY and relay keys via `io:get_chars`
+%% (same path as the raw line editor — a competing file:read on /dev/pts
+%% never sees keypresses while prim_tty owns the device).
 %% ---------------------------------------------------------------------------
 
 -spec run_cmd(binary(), [binary()]) -> {ok, {integer(), binary()}} | {error, binary()}.
 run_cmd(Command, Args) when is_binary(Command), is_list(Args) ->
-    case os:find_executable(unicode:characters_to_list(Command)) of
-        false ->
-            {error, <<"command not found: ", Command/binary>>};
-        Path ->
-            PortArgs = [unicode:characters_to_list(A) || A <- Args],
+    case resolve_cmd(Command, Args) of
+        {error, _} = E ->
+            E;
+        {ok, Path, PortArgs} ->
             try
-                case {os:find_executable("script"), find_tty_path()} of
-                    {Script, {ok, Tty}} when is_list(Script) ->
-                        run_cmd_pty(Script, Path, PortArgs, Tty);
-                    _ ->
-                        run_cmd_direct(Path, PortArgs)
+                run_cmd_capture(Path, PortArgs)
+            catch
+                _:Reason ->
+                    {error, reason_to_bin(Reason)}
+            end
+    end.
+
+%% Foreground interactive: inherit TTY when possible.
+-spec run_cmd_tty(binary(), [binary()]) -> {ok, {integer(), binary()}} | {error, binary()}.
+run_cmd_tty(Command, Args) when is_binary(Command), is_list(Args) ->
+    case resolve_cmd(Command, Args) of
+        {error, _} = E ->
+            E;
+        {ok, Path, PortArgs} ->
+            try
+                case stdout_isatty() of
+                    false ->
+                        run_cmd_capture(Path, PortArgs);
+                    true ->
+                        case {needs_controlling_tty(Path), os:find_executable("script"), find_tty_path()} of
+                            {true, Script, {ok, Tty}} when is_list(Script) ->
+                                run_cmd_pty(Script, Path, PortArgs, Tty);
+                            _ ->
+                                run_cmd_inherit(Path, PortArgs)
+                        end
                 end
             catch
                 _:Reason ->
@@ -1063,22 +1158,72 @@ run_cmd(Command, Args) when is_binary(Command), is_list(Args) ->
             end
     end.
 
-run_cmd_direct(Path, PortArgs) ->
+resolve_cmd(Command, Args) ->
+    case os:find_executable(unicode:characters_to_list(Command)) of
+        false ->
+            {error, <<"command not found: ", Command/binary>>};
+        Path ->
+            PortArgs = [unicode:characters_to_list(A) || A <- Args],
+            {ok, Path, PortArgs}
+    end.
+
+%% Basename check for tools that need a controlling TTY (not just isatty).
+needs_controlling_tty(Path) when is_list(Path) ->
+    Base = filename:basename(Path),
+    lists:member(Base, ["sudo", "run0", "pkexec", "doas", "su"]).
+
+%% Capture mode: pipes, no TTY. `child_env` forces color when the shell wants
+%% it so tools like `jj` still embed ANSI we can pass through on display.
+%%
+%% Stdin is redirected from /dev/null via `sh -c` so programs that read stdin
+%% (bare `less`, `cat`, `wc`) get EOF immediately instead of hanging on an
+%% open-but-never-written pipe. (Port option `out` alone breaks exit_status
+%% delivery on current OTP.)
+run_cmd_capture(Path, PortArgs) ->
+    Sh =
+        case os:find_executable("sh") of
+            false ->
+                "/bin/sh";
+            S ->
+                S
+        end,
+    %% sh -c 'exec "$0" "$@" < /dev/null' path arg1 arg2 ...
+    %% $0 = Path; "$@" = remaining args — no shell-quoting of user args.
     Port = open_port(
-        {spawn_executable, Path},
+        {spawn_executable, Sh},
         [
             binary,
             exit_status,
             stderr_to_stdout,
             use_stdio,
             stream,
+            {env, child_env()},
+            {args, ["-c", "exec \"$0\" \"$@\" < /dev/null", Path | PortArgs]}
+        ]
+    ),
+    put(gleshell_output_shown, false),
+    collect_output(Port, <<>>).
+
+%% Inherit real stdio — pagers/editors talk to the terminal directly.
+%% LESS=FRX (via child_env) lets less pass ANSI colors from jj/git.
+run_cmd_inherit(Path, PortArgs) ->
+    Port = open_port(
+        {spawn_executable, Path},
+        [
+            exit_status,
+            nouse_stdio,
+            {env, child_env()},
             {args, PortArgs}
         ]
     ),
-    collect_output(Port, <<>>).
+    put(gleshell_output_shown, true),
+    %% No timeout: less/vim/top may run for a long time.
+    receive
+        {Port, {exit_status, Status}} ->
+            {ok, {Status, <<>>}}
+    end.
 
-%% Run via `script` so the child gets a controlling TTY (PTY), and relay I/O
-%% with the real terminal for interactive authentication and prompts.
+%% Controlling-TTY + key relay for sudo/run0/etc.
 run_cmd_pty(Script, Path, PortArgs, TtyPath) ->
     Port = open_port(
         {spawn_executable, Script},
@@ -1088,21 +1233,16 @@ run_cmd_pty(Script, Path, PortArgs, TtyPath) ->
             stderr_to_stdout,
             use_stdio,
             stream,
-            %% POSIX shell: caller's $SHELL may be nu/fish and break -c/--.
-            {env, [{"SHELL", "/bin/sh"}]},
+            {env, child_env()},
             {args, ["-q", "-e", "/dev/null", "--", Path | PortArgs]}
         ]
     ),
     case file:open(TtyPath, [write, raw, binary]) of
         {ok, TtyOut} ->
-            %% Raw fds are process-local: reader opens its own handle.
+            GL = group_leader(),
             Reader = spawn(fun() ->
-                case file:open(TtyPath, [read, raw, binary]) of
-                    {ok, TtyIn} ->
-                        tty_to_port(TtyIn, Port);
-                    {error, _} ->
-                        ok
-                end
+                group_leader(GL, self()),
+                io_to_port(Port)
             end),
             put(gleshell_output_shown, true),
             try
@@ -1112,23 +1252,41 @@ run_cmd_pty(Script, Path, PortArgs, TtyPath) ->
                 catch file:close(TtyOut)
             end;
         {error, _} ->
-            %% Could not open the TTY for relay; still better than no PTY.
             put(gleshell_output_shown, false),
-            collect_output(Port, <<>>)
+            %% Fall back to inherit rather than a silent capture hang.
+            run_cmd_inherit(Path, PortArgs)
     end.
 
-tty_to_port(Tty, Port) ->
-    case file:read(Tty, 256) of
-        {ok, Data} when is_binary(Data), Data =/= <<>> ->
-            catch port_command(Port, Data),
-            tty_to_port(Tty, Port);
-        {ok, _} ->
-            tty_to_port(Tty, Port);
+%% Relay keypresses from the group leader to the child's PTY (script stdin).
+io_to_port(Port) ->
+    case io:get_chars("", 1) of
         eof ->
             ok;
         {error, _} ->
-            ok
+            ok;
+        Data ->
+            case io_data_to_bin(Data) of
+                <<>> ->
+                    io_to_port(Port);
+                Bin ->
+                    catch port_command(Port, Bin),
+                    io_to_port(Port)
+            end
     end.
+
+io_data_to_bin(Bin) when is_binary(Bin) ->
+    Bin;
+io_data_to_bin([C]) when is_integer(C), C >= 0, C =< 16#7F ->
+    <<C>>;
+io_data_to_bin(List) when is_list(List) ->
+    case unicode:characters_to_binary(List) of
+        Bin when is_binary(Bin) ->
+            Bin;
+        _ ->
+            <<>>
+    end;
+io_data_to_bin(_) ->
+    <<>>.
 
 collect_output(Port, Acc) ->
     receive
@@ -1144,6 +1302,7 @@ collect_output(Port, Acc) ->
         {error, <<"command timed out after 120s">>}
     end.
 
+%% PTY auth session: no timeout (password prompts, etc.).
 collect_output_relay(Port, Tty, Acc) ->
     receive
         {Port, {data, Data}} when is_binary(Data) ->
@@ -1155,14 +1314,81 @@ collect_output_relay(Port, Tty, Acc) ->
             collect_output_relay(Port, Tty, <<Acc/binary, Bin/binary>>);
         {Port, {exit_status, Status}} ->
             {ok, {Status, normalize_pty_output(Acc)}}
-    after 120_000 ->
-        catch port_close(Port),
-        {error, <<"command timed out after 120s">>}
     end.
 
 %% PTY line discipline often emits CR-LF; normalize to LF for structured use.
 normalize_pty_output(Bin) when is_binary(Bin) ->
     binary:replace(Bin, <<"\r\n">>, <<"\n">>, [global]).
+
+%% Extra env for external commands (merged into the process environment).
+%%
+%% - SHELL=/bin/sh: `script` invokes $SHELL; nu/fish break `script -c`.
+%% - LESS=FRX when unset: pagers (jj/git → less) pass through ANSI colors (-R)
+%%   and exit on short output (-F) without clearing the screen (-X).
+%% - FORCE_COLOR / CLICOLOR_FORCE when the shell itself wants color and the
+%%   child has no TTY (direct path): tools like jj/git/ripgrep emit ANSI so
+%%   we can show their colors when re-printing the captured string.
+child_env() ->
+    Env0 = [{"SHELL", "/bin/sh"}],
+    Env1 =
+        case os:getenv("LESS") of
+            false ->
+                [{"LESS", "FRX"} | Env0];
+            "" ->
+                [{"LESS", "FRX"} | Env0];
+            _ ->
+                Env0
+        end,
+    case want_child_color() of
+        false ->
+            Env1;
+        true ->
+            Env2 =
+                case os:getenv("FORCE_COLOR") of
+                    false ->
+                        [{"FORCE_COLOR", "1"} | Env1];
+                    "0" ->
+                        Env1;
+                    _ ->
+                        Env1
+                end,
+            case os:getenv("CLICOLOR_FORCE") of
+                false ->
+                    [{"CLICOLOR_FORCE", "1"} | Env2];
+                "0" ->
+                    Env2;
+                _ ->
+                    Env2
+            end
+    end.
+
+%% Match gleshell color policy: off under NO_COLOR; otherwise on for a TTY
+%% or when the parent already forces color.
+want_child_color() ->
+    case os:getenv("NO_COLOR") of
+        L when is_list(L), L =/= "" ->
+            false;
+        _ ->
+            case stdout_isatty() of
+                true ->
+                    true;
+                false ->
+                    force_color_set()
+            end
+    end.
+
+force_color_set() ->
+    case os:getenv("FORCE_COLOR") of
+        L when is_list(L), L =/= "", L =/= "0" ->
+            true;
+        _ ->
+            case os:getenv("CLICOLOR_FORCE") of
+                L when is_list(L), L =/= "", L =/= "0" ->
+                    true;
+                _ ->
+                    false
+            end
+    end.
 
 %% True when the last external command already streamed output to the TTY
 %% (PTY relay). Cleared after being read so the REPL does not double-print.

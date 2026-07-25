@@ -250,6 +250,12 @@ pub fn shape_garbage(on: Bool, text: String) -> String {
   paint(on, garbage, text)
 }
 
+/// True if `s` already contains ANSI/VT escapes (e.g. external tool output).
+/// Such strings should be printed as-is rather than re-colored by the shell.
+pub fn contains_ansi(s: String) -> Bool {
+  string.contains(s, "\u{001b}")
+}
+
 /// Visible length ignoring ANSI CSI sequences (`ESC [ … final`).
 pub fn visible_length(s: String) -> Int {
   visible_length_loop(string.to_utf_codepoints(s), 0, AnsiNormal)
