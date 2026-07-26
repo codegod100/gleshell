@@ -187,12 +187,12 @@ pub fn prompt_mark(on: Bool, text: String) -> String {
   paint(on, bold, text)
 }
 
-/// Success character (bold green `❯`).
+/// Success prompt character (bold green).
 pub fn prompt_character_ok(on: Bool, text: String) -> String {
   paint(on, "\u{001b}[1;32m", text)
 }
 
-/// Error character after non-zero exit (bold red `❯`).
+/// Error prompt character after non-zero exit (bold red).
 pub fn prompt_character_err(on: Bool, text: String) -> String {
   paint(on, bold_red, text)
 }

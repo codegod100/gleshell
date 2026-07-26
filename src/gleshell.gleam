@@ -109,8 +109,8 @@ fn repl_loop(env: env.Env) -> Nil {
 }
 
 /// Zero-config prompt inspired by Starship:
-/// blank line, directory (+ optional git branch), then Nerd Font shell icon
-/// + green/red `❯`.
+/// blank line, directory (+ optional git branch), then green/red Nerd Font
+/// shell icon as the prompt character.
 ///
 /// Status lines are printed once; only the character is the line-editor prompt
 /// (the raw editor redraws a single line).
@@ -133,13 +133,15 @@ fn prompt_for(env: env.Env) -> String {
 
 fn prompt_character(last_exit: Int) -> String {
   let on = color.enabled()
-  // Cute Nerd Font marker so you always know you're in gleshell.
-  let icon = color.prompt_name(on, "")
-  let mark = case last_exit {
-    0 -> color.prompt_character_ok(on, "❯")
-    _ -> color.prompt_character_err(on, "❯")
+  // Nerd Font terminal icon; green after success, red after non-zero exit.
+  // Spaces go *after* the color reset. PUA glyphs (nf-oct-terminal) are often
+  // drawn ~2 cells wide while the terminal advances only 1, so a single space
+  // sits under the icon ink and looks missing — use two.
+  let icon = case last_exit {
+    0 -> color.prompt_character_ok(on, "")
+    _ -> color.prompt_character_err(on, "")
   }
-  icon <> " " <> mark <> " "
+  icon <> "  "
 }
 
 /// Full cwd for the prompt, with `$HOME` shown as `~`.

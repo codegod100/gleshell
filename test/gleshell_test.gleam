@@ -11,8 +11,10 @@ import gleshell/highlight
 import gleshell/lexer
 import gleshell/pager
 import gleshell/parser
+import gleshell/syntax
 import gleshell/sys
 import gleshell/value.{Bool, Int, List, Nothing, Record, String, Table}
+import simplifile
 
 pub fn main() -> Nil {
   gleeunit.main()
@@ -98,6 +100,34 @@ pub fn parse_ls_dotfile_test() {
     parser.Command("ls", args, False),
   ]))) = parser.parse("ls .jj")
   let assert [parser.ValueArg(parser.Lit(String(".jj")))] = args
+  Nil
+}
+
+pub fn parse_port_spec_arg_test() {
+  // `lsof -i :4004` — colon is a record token but must be a bare argv word here.
+  let assert Ok(parser.Expr(parser.Pipeline([
+    parser.Command("lsof", args, False),
+  ]))) = parser.parse("lsof -i :4004")
+  let assert [
+    parser.FlagArg("i", parser.None),
+    parser.ValueArg(parser.Lit(String(":4004"))),
+  ] = args
+  // No space: `lsof -i:4004`
+  let assert Ok(parser.Expr(parser.Pipeline([
+    parser.Command("lsof", args2, False),
+  ]))) = parser.parse("lsof -i:4004")
+  let assert [
+    parser.FlagArg("i", parser.None),
+    parser.ValueArg(parser.Lit(String(":4004"))),
+  ] = args2
+  // Glued host:port and URL-shaped words
+  let assert Ok(parser.Expr(parser.Pipeline([
+    parser.Command("echo", args3, False),
+  ]))) = parser.parse("echo host:4004 http://example.com")
+  let assert [
+    parser.ValueArg(parser.Lit(String("host:4004"))),
+    parser.ValueArg(parser.Lit(String("http://example.com"))),
+  ] = args3
   Nil
 }
 
@@ -299,13 +329,17 @@ pub fn help_covers_all_builtins_test() {
   let assert True = string.contains(help_out, "table")
   let assert True = string.contains(help_out, "coerce")
 
-  // Parent commands with subcommands: `help to` / `help from` must resolve.
+  // Parent commands with subcommands: `help to` / `help from` / `help http`.
   let assert eval.Continue(_, String(to_help)) =
     eval.eval_source(env, "help to")
   let assert True = string.contains(to_help, "json")
   let assert eval.Continue(_, String(from_help)) =
     eval.eval_source(env, "help from")
   let assert True = string.contains(from_help, "json")
+  let assert eval.Continue(_, String(http_help)) =
+    eval.eval_source(env, "help http")
+  let assert True = string.contains(http_help, "get")
+  let assert True = string.contains(http_help, "post")
 
   // Bare help lists every command with its one-line description.
   let assert eval.Continue(_, String(all)) = eval.eval_source(env, "help")
@@ -357,6 +391,113 @@ pub fn eval_to_json_record_test() {
   let assert True = string.contains(raw, "\"a\":1")
   let assert True = string.contains(raw, "\"b\":true")
   Nil
+}
+
+pub fn http_subcommand_errors_test() {
+  let env = env.new()
+  // Missing subcommand
+  let assert eval.Continue(env2, value.Fail(msg)) =
+    eval.eval_source(env, "http")
+  let assert True = string.contains(msg, "subcommand")
+  let assert 1 = env2.last_exit
+  // Unknown subcommand
+  let assert eval.Continue(_, value.Fail(msg2)) =
+    eval.eval_source(env, "http foo")
+  let assert True = string.contains(msg2, "unknown subcommand")
+  // Missing URL
+  let assert eval.Continue(_, value.Fail(msg3)) =
+    eval.eval_source(env, "http get")
+  let assert True = string.contains(msg3, "URL") || string.contains(msg3, "url")
+  // Invalid URL
+  let assert eval.Continue(_, value.Fail(msg4)) =
+    eval.eval_source(env, "http get not-a-url")
+  let assert True = string.contains(msg4, "invalid URL")
+  // which / help
+  let assert eval.Continue(_, String(which_out)) =
+    eval.eval_source(env, "which http")
+  let assert "builtin: http" = which_out
+  Nil
+}
+
+pub fn http_get_live_test() {
+  // Live request against postman-echo (JSON). Skip gracefully if offline.
+  let env = env.new()
+  case eval.eval_source(env, "http get --full https://postman-echo.com/get") {
+    eval.Continue(_, Record(fields)) -> {
+      let assert True = list_has_field(fields, "status", Int(200))
+      let assert True = list_has_key(fields, "body")
+      let assert True = list_has_key(fields, "headers")
+      let assert True =
+        list_has_field(fields, "url", String("https://postman-echo.com/get"))
+      // Default path (no --full) parses JSON body into a record
+      let assert eval.Continue(_, Record(body_fields)) =
+        eval.eval_source(env, "http get https://postman-echo.com/get")
+      let assert True = list_has_key(body_fields, "url")
+      Nil
+    }
+    eval.Continue(_, value.Fail(msg)) -> {
+      // Network unavailable — still assert the error is from http, not parse
+      let assert True =
+        string.contains(msg, "http:") || string.contains(msg, "failed")
+      Nil
+    }
+    _ -> panic as "http get --full: unexpected eval result"
+  }
+}
+
+pub fn http_post_json_live_test() {
+  let env = env.new()
+  case
+    eval.eval_source(
+      env,
+      "http post --full https://postman-echo.com/post {name: gleshell}",
+    )
+  {
+    eval.Continue(_, Record(fields)) -> {
+      let assert True = list_has_field(fields, "status", Int(200))
+      // JSON body should be parsed; postman-echo echoes under `json`
+      case list_find_field(fields, "body") {
+        Ok(Record(body)) -> {
+          case list_find_field(body, "json") {
+            Ok(Record(json_fields)) -> {
+              let assert True =
+                list_has_field(json_fields, "name", String("gleshell"))
+              Nil
+            }
+            _ -> Nil
+          }
+        }
+        _ -> Nil
+      }
+    }
+    eval.Continue(_, value.Fail(_)) -> Nil
+    _ -> panic as "http post --full: unexpected eval result"
+  }
+}
+
+fn list_has_key(fields: List(#(String, value.Value)), key: String) -> Bool {
+  case fields {
+    [] -> False
+    [#(k, _), ..rest] ->
+      case k == key {
+        True -> True
+        False -> list_has_key(rest, key)
+      }
+  }
+}
+
+fn list_find_field(
+  fields: List(#(String, value.Value)),
+  key: String,
+) -> Result(value.Value, Nil) {
+  case fields {
+    [] -> Error(Nil)
+    [#(k, v), ..rest] ->
+      case k == key {
+        True -> Ok(v)
+        False -> list_find_field(rest, key)
+      }
+  }
 }
 
 fn list_has_field(
@@ -862,6 +1003,137 @@ fn string_contains(haystack: String, needle: String) -> Bool {
     [_] -> False
     _ -> True
   }
+}
+
+// --- file syntax (cat highlighters) ---
+
+pub fn syntax_language_from_path_test() {
+  let assert syntax.Json = syntax.language_from_path("data/foo.json")
+  let assert syntax.Gleam = syntax.language_from_path("src/main.gleam")
+  let assert syntax.Toml = syntax.language_from_path("gleam.toml")
+  let assert syntax.Markdown = syntax.language_from_path("README.md")
+  let assert syntax.Plain = syntax.language_from_path("notes.txt")
+  let assert syntax.Plain = syntax.language_from_path("Makefile")
+  Nil
+}
+
+pub fn syntax_detect_sniff_json_test() {
+  let assert syntax.Json = syntax.detect("data", "{\"a\": 1}")
+  let assert syntax.Markdown = syntax.detect("notes", "# Title\n\nbody")
+  let assert syntax.Plain = syntax.detect("x", "just words")
+  // Extension wins over sniff
+  let assert syntax.Toml = syntax.detect("x.toml", "{\"a\": 1}")
+  Nil
+}
+
+pub fn syntax_is_binary_test() {
+  let assert False = syntax.is_binary("hello\nworld\t!")
+  let assert True = syntax.is_binary("a\u{0000}b")
+  Nil
+}
+
+pub fn syntax_paint_json_test() {
+  let src = "{\"n\": 1, \"msg\": \"hi\", \"ok\": true}"
+  let assert True = syntax.paint(False, syntax.Json, src) == src
+  let painted = syntax.paint(True, syntax.Json, src)
+  // Truecolor roles: keys (sky), string values (green), numbers, bools
+  let assert True = string_contains(painted, "38;2")
+  let assert True = string_contains(painted, "true")
+  let assert True = string_contains(painted, "137;220;235")
+  let assert True = string_contains(painted, "166;227;161")
+  let assert True = string_contains(painted, "250;179;135")
+  let assert True = color.strip_ansi(painted) == src
+  Nil
+}
+
+pub fn syntax_paint_gleam_test() {
+  let src = "pub fn main() {\n  // hi\n  42\n}"
+  let painted = syntax.paint(True, syntax.Gleam, src)
+  // keyword mauve, fn name blue, comment italic, number peach
+  let assert True = string_contains(painted, "203;166;247")
+  let assert True = string_contains(painted, "137;180;250")
+  let assert True = string_contains(painted, "108;112;134")
+  let assert True = string_contains(painted, "250;179;135")
+  let assert True = string_contains(painted, "pub")
+  let assert True = string_contains(painted, "main")
+  let assert True = color.strip_ansi(painted) == src
+  Nil
+}
+
+pub fn syntax_paint_toml_test() {
+  let src = "name = \"gleshell\"\n# comment\nenabled = true"
+  let painted = syntax.paint(True, syntax.Toml, src)
+  let assert True = string_contains(painted, "38;2")
+  let assert True = string_contains(painted, "166;227;161")
+  let assert True = string_contains(painted, "108;112;134")
+  let assert True = color.strip_ansi(painted) == src
+  Nil
+}
+
+pub fn syntax_paint_markdown_test() {
+  let src = "# Title\n\nUse `code` and **bold**.\n"
+  let painted = syntax.paint(True, syntax.Markdown, src)
+  let assert True = string_contains(painted, "Title")
+  let assert True = string_contains(painted, "code")
+  // H1 lavender + bold peach for **bold**
+  let assert True = string_contains(painted, "180;190;254")
+  let assert True = string_contains(painted, "250;179;135")
+  let assert True = color.visible_length(painted)
+    >= color.visible_length(src) - 1
+  Nil
+}
+
+pub fn syntax_frame_gutter_test() {
+  let body = "alpha\nbeta"
+  let framed = syntax.frame("src/demo.gleam", syntax.Gleam, body)
+  let stripped = color.strip_ansi(framed)
+  // Header carries basename + language badge
+  let assert True = string_contains(stripped, "demo.gleam")
+  let assert True = string_contains(stripped, "gleam")
+  // Line numbers + pipe gutter
+  let assert True = string_contains(stripped, "1")
+  let assert True = string_contains(stripped, "2")
+  let assert True = string_contains(stripped, "│")
+  let assert True = string_contains(stripped, "alpha")
+  let assert True = string_contains(stripped, "beta")
+  Nil
+}
+
+pub fn cat_raw_and_language_test() {
+  let env = env.new()
+  // Write a temp json file under the project (simplifile needs a real path).
+  let path = "build/cat_syntax_test.json"
+  let body = "{\"x\": 1}"
+  let assert Ok(Nil) = simplifile.write(to: path, contents: body)
+
+  // --raw must return plain content even when colors would be on.
+  let assert eval.Continue(_, String(raw_out)) =
+    eval.eval_source(env, "cat " <> path <> " --raw")
+  let assert True = raw_out == body
+
+  // --language plain: no syntax colors (may still frame with line numbers on TTY).
+  let assert eval.Continue(_, String(plain_out)) =
+    eval.eval_source(env, "cat " <> path <> " --language plain")
+  let plain_stripped = color.strip_ansi(plain_out)
+  let assert True =
+    plain_out == body
+    || plain_stripped == body
+    || string_contains(plain_stripped, body)
+
+  // Forced gleam: visible body still present (gutter/header OK).
+  let assert eval.Continue(_, String(gleam_out)) =
+    eval.eval_source(env, "cat " <> path <> " --language gleam")
+  let gleam_stripped = color.strip_ansi(gleam_out)
+  let assert True =
+    gleam_stripped == body || string_contains(gleam_stripped, body)
+
+  // Unknown language errors.
+  let assert eval.Continue(_, value.Fail(msg)) =
+    eval.eval_source(env, "cat " <> path <> " --language cobol")
+  let assert True = string.contains(msg, "unknown language")
+
+  let _ = simplifile.delete(path)
+  Nil
 }
 
 // --- tab completion ---

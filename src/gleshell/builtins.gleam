@@ -1,18 +1,25 @@
 //// Built-in commands (Nushell-inspired structured data tools).
 
 import filepath
+import gleam/bit_array
 import gleam/dict
 import gleam/dynamic/decode
 import gleam/float
+import gleam/http
+import gleam/http/request
+import gleam/http/response
+import gleam/httpc
 import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option
 import gleam/order
 import gleam/string
+import gleshell/color
 import gleshell/display
 import gleshell/env.{type Env}
 import gleshell/pager
+import gleshell/syntax
 import gleshell/sys
 import gleshell/value.{
   type Value, Bool, Fail, Float, Int, List, Nothing, Record, String, Table,
@@ -58,6 +65,8 @@ pub fn registry() -> dict.Dict(String, Builtin) {
     // Nushell-style: `to` / `from` with format subcommands (`json`)
     #("to", cmd_to),
     #("from", cmd_from),
+    // Nushell-style: `http get|post|put|delete|patch|head`
+    #("http", cmd_http),
     #("lines", cmd_lines),
     #("typeof", cmd_type),
     #("type", cmd_type),
@@ -194,6 +203,29 @@ fn help_for(name: String) -> Result(String, Nil) {
         ],
         "\n",
       ))
+    "http" -> Ok(http_help_text())
+    "cat" ->
+      Ok(string.join(
+        [
+          "cat <path> — read a text file as a string",
+          "",
+          "On a color TTY: truecolor syntax highlight (json, gleam, toml,",
+          "markdown), bat-style line numbers, and a filename header.",
+          "Detection uses the extension, then a light content sniff.",
+          "Binary files are refused.",
+          "",
+          "Flags:",
+          "  -r, --raw                 plain text (no colors; safe for pipelines)",
+          "  -l, --language <id>       force language (json|gleam|toml|markdown|plain)",
+          "",
+          "Examples:",
+          "  cat README.md",
+          "  cat src/gleshell.gleam",
+          "  cat data.json --raw | from json",
+          "  cat notes.txt --language markdown",
+        ],
+        "\n",
+      ))
     "find" ->
       Ok(string.join(
         [
@@ -255,7 +287,10 @@ fn help_text() -> dict.Dict(String, String) {
     #("ls", "ls [path] — list directory entries as a table"),
     #("pwd", "pwd — print working directory"),
     #("cd", "cd [path] — change directory (~ supported)"),
-    #("cat", "cat <path> — read file as string"),
+    #(
+      "cat",
+      "cat <path> [--raw] [--language <id>] — read file; syntax-color on TTY",
+    ),
     #("open", "open <path> — open file; parses .json into structured data"),
     #("save", "save <path> — save pipeline input to a file"),
     #(
@@ -288,6 +323,10 @@ fn help_text() -> dict.Dict(String, String) {
     #(
       "from",
       "from <format> — parse structured input (subcommands: json)",
+    ),
+    #(
+      "http",
+      "http <get|post|put|delete|patch|head> <url> [body] — HTTP client",
     ),
     #("lines", "lines — split string input into a list of lines"),
     #("typeof", "typeof — type name of pipeline input"),
@@ -453,17 +492,77 @@ fn cmd_cat(
   env: Env,
   _input: Value,
   args: List(Value),
-  _flags: dict.Dict(String, Value),
+  flags: dict.Dict(String, Value),
 ) -> BuiltinResult {
-  case args {
-    [String(path)] -> {
+  // Boolean flags may steal the next word (`cat --raw path` → flag raw = path).
+  let #(raw, stolen_r) = find_bool_flag(flags, ["raw", "r"])
+  let lang_opt = cat_language_flag(flags)
+  let path_candidates = list.append(args, stolen_r)
+  case lang_opt, path_candidates {
+    Error(msg), _ -> err(env, "cat: " <> msg)
+    Ok(lang_override), [String(path)] -> {
       let path = resolve_path(env, path)
       case simplifile.read(path) {
-        Ok(content) -> ok(env, String(content))
         Error(e) -> err(env, "cat: " <> simplifile.describe_error(e))
+        Ok(content) ->
+          case syntax.is_binary(content) {
+            True ->
+              err(
+                env,
+                "cat: binary file (refusing to print; use an external tool)",
+              )
+            False -> {
+              let language = case lang_override {
+                option.Some(lang) -> lang
+                option.None -> syntax.detect(path, content)
+              }
+              let painted = case raw {
+                True -> content
+                False ->
+                  syntax.present(color.enabled(), language, path, content)
+              }
+              ok(env, String(painted))
+            }
+          }
       }
     }
-    _ -> err(env, "cat: expected path")
+    Ok(_), _ ->
+      err(
+        env,
+        "cat: expected path (try `cat <path>`; --raw / --language <id> optional)",
+      )
+  }
+}
+
+/// `--language` / `-l` override. `Error` is a user-facing message.
+fn cat_language_flag(
+  flags: dict.Dict(String, Value),
+) -> Result(option.Option(syntax.Language), String) {
+  case dict.get(flags, "language"), dict.get(flags, "l") {
+    Ok(v), _ -> cat_parse_language_value(v)
+    _, Ok(v) -> cat_parse_language_value(v)
+    Error(Nil), Error(Nil) -> Ok(option.None)
+  }
+}
+
+fn cat_parse_language_value(
+  v: Value,
+) -> Result(option.Option(syntax.Language), String) {
+  case v {
+    Bool(True) | Nothing ->
+      Error("language flag requires a name (json, gleam, toml, markdown, plain)")
+    other -> {
+      let name = value.as_string(other)
+      case syntax.language_from_name(name) {
+        Ok(lang) -> Ok(option.Some(lang))
+        Error(Nil) ->
+          Error(
+            "unknown language `"
+            <> name
+            <> "` (try json, gleam, toml, markdown, plain)",
+          )
+      }
+    }
   }
 }
 
@@ -1272,6 +1371,464 @@ fn cmd_from_json(
         Ok(v) -> ok(env, v)
         Error(msg) -> err(env, "from: json: " <> msg)
       }
+  }
+}
+
+// --- http (Nushell-style HTTP client with method subcommands) ---
+
+fn http_help_text() -> String {
+  string.join(
+    [
+      "http <method> <url> [body] — make an HTTP request",
+      "",
+      "Subcommands:",
+      "  get <url>              GET request",
+      "  post <url> [body]      POST (body from arg or pipeline input)",
+      "  put <url> [body]       PUT",
+      "  delete <url> [body]    DELETE",
+      "  patch <url> [body]     PATCH",
+      "  head <url>             HEAD (headers only)",
+      "",
+      "Flags:",
+      "  -H, --headers <record|string>  request headers (record or \"Name: value\")",
+      "  -t, --content-type <type>      Content-Type for the body",
+      "  -u, --user <name>              basic-auth username",
+      "  -p, --password <pass>          basic-auth password",
+      "  -m, --max-time <secs>          response timeout in seconds (default 30)",
+      "  -k, --insecure                 skip TLS certificate verification",
+      "  -r, --raw                      keep body as text (do not parse JSON)",
+      "  -f, --full                     return {status, headers, body, url}",
+      "  -e, --allow-errors             do not fail on non-2xx status",
+      "",
+      "JSON responses are parsed into structured data unless --raw is set.",
+      "Structured request bodies (records/lists/tables) are JSON-encoded and",
+      "sent with Content-Type: application/json when no type is specified.",
+      "",
+      "Examples:",
+      "  http get https://example.com",
+      "  http get --full https://httpbin.org/get",
+      "  http post https://httpbin.org/post {name: alice}",
+      "  http get -H {accept: application/json} https://api.example.com/v1",
+      "  echo {x: 1} | http post https://httpbin.org/post",
+    ],
+    "\n",
+  )
+}
+
+fn cmd_http(
+  env: Env,
+  input: Value,
+  args: List(Value),
+  flags: dict.Dict(String, Value),
+) -> BuiltinResult {
+  case args {
+    [] ->
+      err(
+        env,
+        "http: expected subcommand (try `http get <url>`; see `help http`)",
+      )
+    [String(sub), ..rest] ->
+      case http_method_from_sub(sub) {
+        Ok(method) -> http_request(env, input, method, rest, flags)
+        Error(Nil) -> err(env, "http: unknown subcommand: " <> sub)
+      }
+    _ -> err(env, "http: expected subcommand name")
+  }
+}
+
+fn http_method_from_sub(sub: String) -> Result(http.Method, Nil) {
+  case string.lowercase(sub) {
+    "get" -> Ok(http.Get)
+    "post" -> Ok(http.Post)
+    "put" -> Ok(http.Put)
+    "delete" -> Ok(http.Delete)
+    "patch" -> Ok(http.Patch)
+    "head" -> Ok(http.Head)
+    _ -> Error(Nil)
+  }
+}
+
+fn http_request(
+  env: Env,
+  input: Value,
+  method: http.Method,
+  args: List(Value),
+  flags: dict.Dict(String, Value),
+) -> BuiltinResult {
+  let method_name = http.method_to_string(method)
+  // Boolean flags may steal the next word as their value
+  // (`http get --full https://…` → flag full = "https://…").
+  let #(_full, stolen_f) = find_bool_flag(flags, ["full", "f"])
+  let #(_raw, stolen_r) = find_bool_flag(flags, ["raw", "r"])
+  let #(_insecure, stolen_k) = find_bool_flag(flags, ["insecure", "k"])
+  let #(_allow, stolen_e) = find_bool_flag(flags, ["allow-errors", "e"])
+  let candidates =
+    list.flatten([args, stolen_f, stolen_r, stolen_k, stolen_e])
+  case http_take_url(candidates) {
+    Error(Nil) -> err(env, "http: " <> method_name <> ": expected URL")
+    Ok(#(url, body_args)) ->
+      case string.trim(url) {
+        "" -> err(env, "http: " <> method_name <> ": empty URL")
+        url ->
+          case request.to(url) {
+            Error(Nil) ->
+              err(env, "http: " <> method_name <> ": invalid URL: " <> url)
+            Ok(base) -> {
+              let body_opt = http_resolve_body(method, input, body_args)
+              let #(body_text, auto_json) = case body_opt {
+                option.None -> #("", False)
+                option.Some(body) -> http_encode_body(body)
+              }
+              let req =
+                base
+                |> request.set_method(method)
+                |> request.set_body(body_text)
+                |> http_apply_headers(flags, auto_json)
+                |> http_apply_auth(flags)
+              let config = http_config(flags)
+              case httpc.dispatch(config, req) {
+                Error(e) ->
+                  err(
+                    env,
+                    "http: " <> method_name <> ": " <> http_error_message(e),
+                  )
+                Ok(resp) ->
+                  http_handle_response(env, method_name, url, resp, flags)
+              }
+            }
+          }
+      }
+  }
+}
+
+/// Pick a URL from mixed positionals + values stolen by boolean flags.
+/// Prefers a URL-shaped string (`http(s)://…`); otherwise the first value.
+fn http_take_url(
+  values: List(Value),
+) -> Result(#(String, List(Value)), Nil) {
+  case values {
+    [] -> Error(Nil)
+    _ ->
+      case http_find_url_index(values, 0) {
+        option.Some(i) -> {
+          let url = case list_at(values, i) {
+            Ok(v) -> value.as_string(v)
+            Error(Nil) -> ""
+          }
+          let rest =
+            values
+            |> list.index_map(fn(v, idx) { #(idx, v) })
+            |> list.filter_map(fn(pair) {
+              let #(idx, v) = pair
+              case idx == i {
+                True -> Error(Nil)
+                False -> Ok(v)
+              }
+            })
+          Ok(#(url, rest))
+        }
+        option.None ->
+          case values {
+            [first, ..rest] -> Ok(#(value.as_string(first), rest))
+            [] -> Error(Nil)
+          }
+      }
+  }
+}
+
+fn http_find_url_index(
+  values: List(Value),
+  index: Int,
+) -> option.Option(Int) {
+  case values {
+    [] -> option.None
+    [v, ..rest] ->
+      case v {
+        String(s) ->
+          case http_looks_like_url(s) {
+            True -> option.Some(index)
+            False -> http_find_url_index(rest, index + 1)
+          }
+        _ -> http_find_url_index(rest, index + 1)
+      }
+  }
+}
+
+fn http_looks_like_url(s: String) -> Bool {
+  string.starts_with(s, "http://")
+  || string.starts_with(s, "https://")
+  || string.contains(s, "://")
+}
+
+fn http_resolve_body(
+  method: http.Method,
+  input: Value,
+  body_args: List(Value),
+) -> option.Option(Value) {
+  case method {
+    http.Get | http.Head -> option.None
+    _ ->
+      case body_args {
+        [body, ..] -> option.Some(body)
+        [] ->
+          case input {
+            Nothing -> option.None
+            Fail(_) -> option.None
+            _ -> option.Some(input)
+          }
+      }
+  }
+}
+
+/// Encode a body value. Returns `(text, is_json_structured)`.
+fn http_encode_body(body: Value) -> #(String, Bool) {
+  case body {
+    String(s) -> #(s, False)
+    Nothing -> #("", False)
+    other -> #(encode_json(other, option.None, 0), True)
+  }
+}
+
+fn http_apply_headers(
+  req: request.Request(String),
+  flags: dict.Dict(String, Value),
+  auto_json: Bool,
+) -> request.Request(String) {
+  let req = case auto_json {
+    True ->
+      case http_flag_string(flags, ["content-type", "t"]) {
+        option.Some(_) -> req
+        option.None ->
+          request.set_header(req, "content-type", "application/json")
+      }
+    False -> req
+  }
+  let req = case http_flag_string(flags, ["content-type", "t"]) {
+    option.Some(ct) -> request.set_header(req, "content-type", ct)
+    option.None -> req
+  }
+  case http_flag_value(flags, ["headers", "H"]) {
+    option.None -> req
+    option.Some(headers_val) ->
+      list.fold(http_parse_headers(headers_val), req, fn(acc, pair) {
+        let #(k, v) = pair
+        request.set_header(acc, string.lowercase(k), v)
+      })
+  }
+}
+
+fn http_parse_headers(val: Value) -> List(#(String, String)) {
+  case val {
+    Record(fields) ->
+      list.map(fields, fn(pair) {
+        let #(k, v) = pair
+        #(k, value.as_string(v))
+      })
+    List(items) ->
+      list.flat_map(items, fn(item) {
+        case item {
+          String(s) -> http_parse_header_line(s)
+          Record(fields) ->
+            list.map(fields, fn(pair) {
+              let #(k, v) = pair
+              #(k, value.as_string(v))
+            })
+          _ -> []
+        }
+      })
+    String(s) -> http_parse_header_line(s)
+    _ -> []
+  }
+}
+
+fn http_parse_header_line(s: String) -> List(#(String, String)) {
+  case string.split_once(s, ":") {
+    Ok(#(name, rest)) -> [#(string.trim(name), string.trim(rest))]
+    Error(Nil) ->
+      case string.trim(s) {
+        "" -> []
+        _ -> [#(string.trim(s), "")]
+      }
+  }
+}
+
+fn http_apply_auth(
+  req: request.Request(String),
+  flags: dict.Dict(String, Value),
+) -> request.Request(String) {
+  case http_flag_string(flags, ["user", "u"]) {
+    option.None -> req
+    option.Some(user) -> {
+      let pass = case http_flag_string(flags, ["password", "p"]) {
+        option.Some(p) -> p
+        option.None -> ""
+      }
+      let token =
+        bit_array.base64_encode(bit_array.from_string(user <> ":" <> pass), True)
+      request.set_header(req, "authorization", "Basic " <> token)
+    }
+  }
+}
+
+fn http_config(flags: dict.Dict(String, Value)) -> httpc.Configuration {
+  let insecure =
+    flag_set(flags, "insecure") || flag_set(flags, "k")
+  let timeout_ms = case http_flag_int(flags, ["max-time", "m"]) {
+    option.Some(secs) if secs > 0 -> secs * 1000
+    _ -> 30_000
+  }
+  httpc.configure()
+  |> httpc.verify_tls(!insecure)
+  |> httpc.timeout(timeout_ms)
+  |> httpc.follow_redirects(True)
+}
+
+fn http_handle_response(
+  env: Env,
+  method_name: String,
+  url: String,
+  resp: response.Response(String),
+  flags: dict.Dict(String, Value),
+) -> BuiltinResult {
+  let raw = flag_set(flags, "raw") || flag_set(flags, "r")
+  let full = flag_set(flags, "full") || flag_set(flags, "f")
+  let allow_errors =
+    flag_set(flags, "allow-errors") || flag_set(flags, "e")
+  let body_val = case raw {
+    True -> String(resp.body)
+    False -> http_decode_body(resp)
+  }
+  let headers_record =
+    Record(
+      list.map(resp.headers, fn(pair) {
+        let #(k, v) = pair
+        #(k, String(v))
+      }),
+    )
+  let ok_status = resp.status >= 200 && resp.status < 300
+  case full {
+    True -> {
+      let result =
+        Record([
+          #("status", Int(resp.status)),
+          #("headers", headers_record),
+          #("body", body_val),
+          #("url", String(url)),
+        ])
+      case ok_status || allow_errors {
+        True -> ok(env, result)
+        False ->
+          err(
+            env,
+            "http: "
+              <> method_name
+              <> ": HTTP "
+              <> int.to_string(resp.status)
+              <> " from "
+              <> url,
+          )
+      }
+    }
+    False ->
+      case ok_status || allow_errors {
+        True -> ok(env, body_val)
+        False ->
+          err(
+            env,
+            "http: "
+              <> method_name
+              <> ": HTTP "
+              <> int.to_string(resp.status)
+              <> " from "
+              <> url
+              <> case string.trim(resp.body) {
+                "" -> ""
+                body -> ": " <> string.slice(body, 0, 200)
+              },
+          )
+      }
+  }
+}
+
+fn http_decode_body(resp: response.Response(String)) -> Value {
+  let looks_json = case response.get_header(resp, "content-type") {
+    Ok(ct) -> {
+      let lower = string.lowercase(ct)
+      string.contains(lower, "json") || string.contains(lower, "+json")
+    }
+    Error(Nil) -> False
+  }
+  let trimmed = string.trim(resp.body)
+  case looks_json || string.starts_with(trimmed, "{") || string.starts_with(
+    trimmed,
+    "[",
+  ) {
+    True ->
+      case parse_json_value(resp.body) {
+        Ok(v) -> v
+        Error(_) -> String(resp.body)
+      }
+    False -> String(resp.body)
+  }
+}
+
+fn http_error_message(e: httpc.HttpError) -> String {
+  case e {
+    httpc.InvalidUtf8Response -> "response body is not valid UTF-8"
+    httpc.ResponseTimeout -> "response timed out"
+    httpc.FailedToConnect(ip4, ip6) ->
+      "failed to connect ("
+      <> http_connect_error(ip4)
+      <> " / "
+      <> http_connect_error(ip6)
+      <> ")"
+  }
+}
+
+fn http_connect_error(e: httpc.ConnectError) -> String {
+  case e {
+    httpc.Posix(code) -> code
+    httpc.TlsAlert(code, detail) -> code <> ": " <> detail
+  }
+}
+
+fn http_flag_value(
+  flags: dict.Dict(String, Value),
+  names: List(String),
+) -> option.Option(Value) {
+  case names {
+    [] -> option.None
+    [name, ..rest] ->
+      case dict.get(flags, name) {
+        Ok(v) -> option.Some(v)
+        Error(Nil) -> http_flag_value(flags, rest)
+      }
+  }
+}
+
+fn http_flag_string(
+  flags: dict.Dict(String, Value),
+  names: List(String),
+) -> option.Option(String) {
+  case http_flag_value(flags, names) {
+    option.Some(String(s)) -> option.Some(s)
+    option.Some(v) -> option.Some(value.as_string(v))
+    option.None -> option.None
+  }
+}
+
+fn http_flag_int(
+  flags: dict.Dict(String, Value),
+  names: List(String),
+) -> option.Option(Int) {
+  case http_flag_value(flags, names) {
+    option.Some(Int(n)) -> option.Some(n)
+    option.Some(String(s)) ->
+      case int.parse(s) {
+        Ok(n) -> option.Some(n)
+        Error(Nil) -> option.None
+      }
+    _ -> option.None
   }
 }
 

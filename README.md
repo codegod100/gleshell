@@ -6,7 +6,7 @@ Instead of piping opaque text between programs, gleshell pipelines pass typed va
 
 ```text
 ~/code/gleshell on  main
- ❯ ls | where type == file | select name size | first 5
+ ls | where type == file | select name size | first 5
 ╭──────┬──────╮
 │ name │ size │
 ├──────┼──────┤
@@ -16,7 +16,7 @@ Instead of piping opaque text between programs, gleshell pipelines pass typed va
 
 The interactive prompt is zero-config and Starship-inspired: full path with `~`,
 optional git branch (read from `.git`, no external tools), and a Nerd Font shell
-icon (``) before the `❯` character (which turns red after a non-zero exit).
+icon (``) as the prompt character (turns red after a non-zero exit).
 Install a Nerd Font so the glyphs render (flake: `nix profile install
 .#nerd-fonts`, or put `nerd-fonts.symbols-only` in your system/fonts packages;
 the devenv shell already includes it).
@@ -132,11 +132,16 @@ which -a ls
 
 ## Built-ins
 
-Filesystem: `ls`, `cd`, `pwd`, `cat`, `open`, `save`
+Filesystem: `ls`, `cd`, `pwd`, `cat` (MIME/extension detect + syntax color on TTY;
+`--raw` for plain pipelines), `open`, `save`
 
 Table/list: `where`/`filter`, `find`, `select`, `get`, `first`, `last`, `take`, `skip`, `sort-by`, `reverse`, `length`, `columns`, `table`, `flatten`, `uniq`, `wrap`, `unwrap`, `keys`, `values`
 
 Data: `echo`, `range`, `lines`, `to`/`from` (subcommand `json`), `type`, `describe`, `env`, `sys`, `which`, `help`, `about`, `exit`
+
+HTTP: `http get|post|put|delete|patch|head` — fetch/send with structured JSON bodies
+and responses (`http get https://example.com`, `http post URL {a: 1}`, `--full`,
+`-H` headers, `--raw`, `--allow-errors`)
 
 Pager: `less` — builtin color-aware pager for pipeline input or files (`ls | less`,
 `less README.md`). ANSI from tables and external tools is kept; short output is
@@ -161,6 +166,7 @@ src/
     display.gleam         # table pretty-printer
     color.gleam           # Nushell-style ANSI colors
     highlight.gleam       # live input syntax highlighting
+    syntax.gleam          # file language detect + cat highlighters
     env.gleam / sys.gleam
 ```
 

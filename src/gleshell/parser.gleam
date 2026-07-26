@@ -242,7 +242,8 @@ fn parse_args(
       case is_expr_start(rest) {
         True -> {
           use #(expr, rest2) <- result_try(parse_expr(rest))
-          parse_args(rest2, [FlagArg(name, Some(expr)), ..acc])
+          use #(glued, rest3) <- result_try(glue_colon_suffix(expr, rest2))
+          parse_args(rest3, [FlagArg(name, Some(glued)), ..acc])
         }
         False -> parse_args(rest, [FlagArg(name, None), ..acc])
       }
@@ -256,15 +257,85 @@ fn parse_args(
     [Le, ..rest] -> parse_args(rest, [ValueArg(Lit(value.String("<="))), ..acc])
     [Assign, ..rest] ->
       parse_args(rest, [ValueArg(Lit(value.String("=="))), ..acc])
+    // Port specs / URL pieces: `:4004`, `://host` (Colon is reserved for records).
+    [Colon, ..rest] -> {
+      case parse_colon_atom(rest) {
+        Ok(#(piece, rest2)) ->
+          parse_args(rest2, [ValueArg(Lit(value.String(":" <> piece))), ..acc])
+        Error(_) ->
+          parse_args(rest, [ValueArg(Lit(value.String(":"))), ..acc])
+      }
+    }
     _ -> {
       case is_expr_start(tokens) {
         True -> {
           use #(expr, rest) <- result_try(parse_expr(tokens))
-          parse_args(rest, [ValueArg(expr), ..acc])
+          use #(glued, rest2) <- result_try(glue_colon_suffix(expr, rest))
+          parse_args(rest2, [ValueArg(glued), ..acc])
         }
         False -> Ok(#(list.reverse(acc), tokens))
       }
     }
+  }
+}
+
+/// Absorb adjacent `:atom` tails into one bareword (`host:4004`, `http://x`).
+/// Colon is a separate lexer token (records need it), so argv words reassemble here.
+fn glue_colon_suffix(
+  expr: Expr,
+  tokens: List(Token),
+) -> Result(#(Expr, List(Token)), ParseError) {
+  case tokens {
+    [Colon, ..rest] ->
+      case is_simple_bare_lit(expr) {
+        True -> {
+          let head = expr_to_bare_string(expr)
+          case parse_colon_atom(rest) {
+            Ok(#(piece, rest2)) ->
+              glue_colon_suffix(
+                Lit(value.String(head <> ":" <> piece)),
+                rest2,
+              )
+            Error(_) -> Ok(#(Lit(value.String(head <> ":")), rest))
+          }
+        }
+        False -> Ok(#(expr, tokens))
+      }
+    _ -> Ok(#(expr, tokens))
+  }
+}
+
+fn is_simple_bare_lit(expr: Expr) -> Bool {
+  case expr {
+    Lit(value.String(_))
+    | Lit(value.Int(_))
+    | Lit(value.Float(_))
+    | Lit(value.Bool(_)) -> True
+    _ -> False
+  }
+}
+
+fn expr_to_bare_string(expr: Expr) -> String {
+  case expr {
+    Lit(v) -> value.as_string(v)
+    Var(name) -> "$" <> name
+    ListExpr(_) -> "[]"
+    RecordExpr(_) -> "{}"
+  }
+}
+
+/// Token after `:` in a bareword: number, ident/path, string, or bool.
+fn parse_colon_atom(
+  tokens: List(Token),
+) -> Result(#(String, List(Token)), ParseError) {
+  case tokens {
+    [IntLit(n), ..rest] -> Ok(#(int.to_string(n), rest))
+    [FloatLit(f), ..rest] -> Ok(#(value.as_string(value.Float(f)), rest))
+    [StringLit(s), ..rest] -> Ok(#(s, rest))
+    [Ident(s), ..rest] -> Ok(#(s, rest))
+    [BoolLit(True), ..rest] -> Ok(#("true", rest))
+    [BoolLit(False), ..rest] -> Ok(#("false", rest))
+    _ -> Error(ParseError("expected word after :"))
   }
 }
 

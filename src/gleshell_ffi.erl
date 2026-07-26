@@ -443,10 +443,16 @@ enable_shell_history() ->
 
 raw_get_line(Prompt) when is_binary(Prompt) ->
     PromptList = unicode:characters_to_list(Prompt),
-    History = case get(gleshell_history) of
-        L when is_list(L) -> L;
-        _ -> []
-    end,
+    %% Densify every prompt: drop blanks so ↑ never lands on an empty slot
+    %% even if an older session or bug left one in the process dict.
+    History = sanitize_history(
+        case get(gleshell_history) of
+            L when is_list(L) -> L;
+            _ -> []
+        end
+    ),
+    put(gleshell_history, History),
+    put(gleshell_input_rows, 1),
     redraw(PromptList, [], []),
     raw_loop(PromptList, [], [], History, 0, <<>>).
 
@@ -915,28 +921,56 @@ pad_cell(S, Width) ->
     end.
 
 hist_nav(Prompt, Left, Right, History, HistPos, Saved, Delta) ->
-    NewPos = HistPos + Delta,
-    Len = length(History),
-    if
-        NewPos < 0 ->
+    case hist_seek(History, HistPos, Delta) of
+        stay ->
             raw_loop(Prompt, Left, Right, History, HistPos, Saved);
-        NewPos =:= 0 ->
-            %% Restore saved draft
+        draft ->
+            %% Restore the buffer from before history navigation.
             {L, R} = bin_to_buffer(Saved),
             redraw(Prompt, L, R),
             raw_loop(Prompt, L, R, History, 0, <<>>);
-        NewPos > Len ->
-            raw_loop(Prompt, Left, Right, History, HistPos, Saved);
-        true ->
+        {NewPos, Entry} ->
             NewSaved = case HistPos of
                 0 -> buffer_to_bin(Left, Right);
                 _ -> Saved
             end,
-            Entry = lists:nth(NewPos, History),
-            {L, R} = bin_to_buffer(Entry),
-            redraw(Prompt, L, R),
-            raw_loop(Prompt, L, R, History, NewPos, NewSaved)
+            %% Belt-and-suspenders: never paint a blank recall (dense History
+            %% should already exclude these).
+            case history_blank(Entry) of
+                true ->
+                    hist_nav(Prompt, Left, Right, History, NewPos, NewSaved, Delta);
+                false ->
+                    {L, R} = bin_to_buffer(Entry),
+                    redraw(Prompt, L, R),
+                    raw_loop(Prompt, L, R, History, NewPos, NewSaved)
+            end
     end.
+
+%% Walk history in `Delta` direction, skipping blank/whitespace-only entries.
+%% Delta > 0 = older (↑); Delta < 0 = newer (↓). Position 0 is the live draft.
+%% History is expected newest-first and already densified (no blanks), but we
+%% still skip blanks so a stale list cannot surface an empty ↑ recall.
+hist_seek(_History, 0, Delta) when Delta < 0 ->
+    stay;
+hist_seek(History, HistPos, Delta) when Delta > 0 ->
+    hist_seek_loop(History, HistPos + 1, 1, length(History));
+hist_seek(History, HistPos, Delta) when Delta < 0 ->
+    hist_seek_loop(History, HistPos - 1, -1, length(History)).
+
+hist_seek_loop(_History, Pos, Step, _Len) when Step < 0, Pos =< 0 ->
+    draft;
+hist_seek_loop(_History, Pos, Step, Len) when Step > 0, Pos > Len ->
+    stay;
+hist_seek_loop(History, Pos, Step, Len) when Pos >= 1, Pos =< Len ->
+    Entry = lists:nth(Pos, History),
+    case history_blank(Entry) of
+        true ->
+            hist_seek_loop(History, Pos + Step, Step, Len);
+        false ->
+            {Pos, Entry}
+    end;
+hist_seek_loop(_History, _Pos, _Step, _Len) ->
+    stay.
 
 %% Minimal Ctrl+R reverse-i-search over history.
 reverse_search(Prompt, History) ->
@@ -953,10 +987,19 @@ reverse_search_loop(Prompt, History, Query, Match) ->
             {error, <<"eof">>};
         enter ->
             %% Accept match onto the edit line; do not submit (edit first).
+            %% Empty match (no query / no hit) — return to an empty draft
+            %% rather than "accepting" a blank line that later looks like a
+            %% phantom history entry when browsing with ↑.
             Line = iolist_to_binary(Match),
-            {L, R} = bin_to_buffer(Line),
-            redraw(Prompt, L, R),
-            raw_loop(Prompt, L, R, History, 0, <<>>);
+            case history_blank(Line) of
+                true ->
+                    redraw(Prompt, [], []),
+                    raw_loop(Prompt, [], [], History, 0, <<>>);
+                false ->
+                    {L, R} = bin_to_buffer(Line),
+                    redraw(Prompt, L, R),
+                    raw_loop(Prompt, L, R, History, 0, <<>>)
+            end;
         ctrl_c ->
             io:put_chars("\r\n"),
             redraw(Prompt, [], []),
@@ -1044,15 +1087,85 @@ drop_while_word([_ | Rest]) ->
 
 redraw(Prompt, Left, Right) ->
     Full = lists:reverse(Left) ++ Right,
-    FullBin = unicode:characters_to_binary(Full),
+    FullBin =
+        case unicode:characters_to_binary(Full) of
+            Bin when is_binary(Bin) -> Bin;
+            _ -> <<>>
+        end,
     Colored = highlight_line(FullBin),
-    io:put_chars([$\r, Prompt, Colored, ?CSI_CLEAR_EOL]),
+    %% Clear every physical row the previous render occupied. A longer history
+    %% entry can soft-wrap; `\e[2K` alone only erases the current row, so a
+    %% shorter recall (or empty draft) used to leave a blank-looking row and
+    %% stale wrap residue that felt like an empty ↑ slot.
+    clear_input_rows(),
+    io:put_chars([Prompt, Colored]),
+    Rows = count_input_rows(Prompt, FullBin),
+    put(gleshell_input_rows, Rows),
     case length(Right) of
         0 ->
             ok;
         N ->
+            %% Best-effort: codepoint count ≈ columns for ASCII-heavy input.
             io:put_chars(["\e[", integer_to_list(N), $D])
     end.
+
+%% Move to the start of the previous input block and erase its rows.
+clear_input_rows() ->
+    Rows0 =
+        case get(gleshell_input_rows) of
+            N when is_integer(N), N > 0 -> N;
+            _ -> 1
+        end,
+    %% Cap so a bad columns() estimate cannot wipe the path line above the prompt.
+    Rows = min(Rows0, 16),
+    %% Cursor sits on the last physical row of the previous draw when Right=[].
+    case Rows of
+        1 ->
+            io:put_chars([$\r, "\e[2K"]);
+        _ ->
+            Up = Rows - 1,
+            io:put_chars([$\r, "\e[", integer_to_list(Up), $A, "\e[J"])
+    end.
+
+%% How many terminal rows does prompt+line occupy (ANSI-aware, 1-col glyphs).
+count_input_rows(Prompt, FullBin) ->
+    Cols =
+        case io:columns() of
+            {ok, C} when is_integer(C), C >= 8 -> C;
+            {ok, C} when is_integer(C), C > 0 -> 8;
+            _ -> 80
+        end,
+    PW = visible_width(Prompt),
+    FW = visible_width(FullBin),
+    Total = PW + FW,
+    case Total =< 0 of
+        true -> 1;
+        false -> min(16, (Total + Cols - 1) div Cols)
+    end.
+
+%% Visible column count ignoring CSI (ESC [ … final). Wide glyphs count as 1
+%% (same approximation as the pager); good enough to clear wrap residue.
+visible_width(Data) when is_binary(Data) ->
+    visible_width(unicode:characters_to_list(Data));
+visible_width(List) when is_list(List) ->
+    visible_width_loop(List, 0, normal);
+visible_width(_) ->
+    0.
+
+visible_width_loop([], Acc, _) ->
+    Acc;
+visible_width_loop([16#1b | Rest], Acc, normal) ->
+    visible_width_loop(Rest, Acc, esc);
+visible_width_loop([_C | Rest], Acc, normal) ->
+    visible_width_loop(Rest, Acc + 1, normal);
+visible_width_loop([$[ | Rest], Acc, esc) ->
+    visible_width_loop(Rest, Acc, csi);
+visible_width_loop([_ | Rest], Acc, esc) ->
+    visible_width_loop(Rest, Acc, normal);
+visible_width_loop([C | Rest], Acc, csi) when C >= 16#40, C =< 16#7e ->
+    visible_width_loop(Rest, Acc, normal);
+visible_width_loop([_ | Rest], Acc, csi) ->
+    visible_width_loop(Rest, Acc, csi).
 
 highlight_line(Bin) when is_binary(Bin) ->
     case get(gleshell_color) of
@@ -1206,13 +1319,12 @@ load_line_history() ->
     File = history_file(),
     case file:read_file(File) of
         {ok, Bin} ->
-            Lines = [
-                L
-             || L <- binary:split(Bin, <<"\n">>, [global]),
-                L =/= <<>>
+            Lines0 = [
+                string:trim(L, trailing, [$\r])
+             || L <- binary:split(Bin, <<"\n">>, [global])
             ],
-            %% Newest first
-            put(gleshell_history, lists:reverse(Lines));
+            %% Newest first; sanitize drops blanks / ANSI-only / ZWSP-only.
+            put(gleshell_history, sanitize_history(lists:reverse(Lines0)));
         _ ->
             put(gleshell_history, [])
     end,
@@ -1224,26 +1336,101 @@ save_line_history() ->
         Hist when is_list(Hist) ->
             File = history_file(),
             _ = filelib:ensure_dir(File),
-            %% Store oldest-first for human readability
-            Body = [[L, $\n] || L <- lists:reverse(lists:sublist(Hist, ?HISTORY_MAX))],
+            %% Store oldest-first for human readability; drop blanks.
+            Kept = lists:sublist(sanitize_history(Hist), ?HISTORY_MAX),
+            Body = [[L, $\n] || L <- lists:reverse(Kept)],
             _ = file:write_file(File, Body),
             ok;
         _ ->
             ok
     end.
 
-push_history(<<>>) ->
-    ok;
+%% Drop blank entries; keep order (newest first).
+sanitize_history(Hist) when is_list(Hist) ->
+    [L || L <- Hist, not history_blank(L)];
+sanitize_history(_) ->
+    [].
+
+%% Empty / whitespace-only / ANSI-only / zero-width-only lines look blank when
+%% recalled with ↑ — never store or navigate to them.
+history_blank(Bin) when is_binary(Bin) ->
+    history_blank_visible(string:trim(Bin));
+history_blank(List) when is_list(List) ->
+    case unicode:characters_to_binary(List) of
+        Bin when is_binary(Bin) ->
+            history_blank_visible(string:trim(Bin));
+        _ ->
+            true
+    end;
+history_blank(_) ->
+    true.
+
+history_blank_visible(Bin) when is_binary(Bin) ->
+    case strip_ansi_bin(Bin) of
+        <<>> ->
+            true;
+        Visible ->
+            case unicode:characters_to_list(Visible) of
+                List when is_list(List), List =/= [] ->
+                    %% ZWSP / ZWNJ / ZWJ / BOM / soft hyphen — render as empty.
+                    lists:all(
+                        fun(C) ->
+                            C =:= 16#200B orelse C =:= 16#200C orelse
+                                C =:= 16#200D orelse C =:= 16#FEFF orelse
+                                C =:= 16#00AD
+                        end,
+                        List
+                    );
+                _ ->
+                    false
+            end
+    end.
+
+%% Strip CSI sequences (ESC [ … final) for blank detection.
+strip_ansi_bin(Bin) when is_binary(Bin) ->
+    case unicode:characters_to_list(Bin) of
+        List when is_list(List) ->
+            unicode:characters_to_binary(strip_ansi_list(List, normal, []));
+        _ ->
+            Bin
+    end.
+
+strip_ansi_list([], _State, Acc) ->
+    lists:reverse(Acc);
+strip_ansi_list([16#1b | Rest], normal, Acc) ->
+    strip_ansi_list(Rest, esc, Acc);
+strip_ansi_list([C | Rest], normal, Acc) ->
+    strip_ansi_list(Rest, normal, [C | Acc]);
+strip_ansi_list([$[ | Rest], esc, Acc) ->
+    strip_ansi_list(Rest, csi, Acc);
+strip_ansi_list([_ | Rest], esc, Acc) ->
+    strip_ansi_list(Rest, normal, Acc);
+strip_ansi_list([C | Rest], csi, Acc) when C >= 16#40, C =< 16#7e ->
+    strip_ansi_list(Rest, normal, Acc);
+strip_ansi_list([_ | Rest], csi, Acc) ->
+    strip_ansi_list(Rest, csi, Acc).
+
 push_history(Line) when is_binary(Line) ->
-    Hist = case get(gleshell_history) of
-        L when is_list(L) -> L;
-        _ -> []
-    end,
-    New = case Hist of
-        [Line | _] -> Hist;
-        _ -> [Line | Hist]
-    end,
-    put(gleshell_history, lists:sublist(New, ?HISTORY_MAX)),
+    %% Trim so "  ls  " does not become a near-blank distinct from "ls".
+    Trimmed = string:trim(Line),
+    case history_blank(Trimmed) of
+        true ->
+            ok;
+        false ->
+            Hist = sanitize_history(
+                case get(gleshell_history) of
+                    L when is_list(L) -> L;
+                    _ -> []
+                end
+            ),
+            New = case Hist of
+                [Trimmed | _] -> Hist;
+                _ -> [Trimmed | Hist]
+            end,
+            put(gleshell_history, lists:sublist(New, ?HISTORY_MAX)),
+            ok
+    end;
+push_history(_) ->
     ok.
 
 %% ---------------------------------------------------------------------------
