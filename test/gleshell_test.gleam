@@ -102,6 +102,39 @@ pub fn lexer_flake_ref_hash_test() {
   Nil
 }
 
+pub fn lexer_ssh_user_at_host_test() {
+  // Mid-token `@` is part of the bareword (git SSH URLs, user@host).
+  let assert Ok(tokens) =
+    lexer.tokenize("git clone git@tangled.org:tranquil.farm/tranquil-pds")
+  let assert [
+    lexer.Ident("git"),
+    lexer.Ident("clone"),
+    lexer.Ident("git@tangled.org"),
+    lexer.Colon,
+    lexer.Ident("tranquil.farm/tranquil-pds"),
+    lexer.Eof,
+  ] = tokens
+  // Bare `@` at a word boundary is still an error (not a valid bareword start).
+  let assert Error(lexer.LexError("unexpected character '@'", 0)) =
+    lexer.tokenize("@alone")
+  Nil
+}
+
+pub fn parse_ssh_git_url_test() {
+  // Colon glue reassembly: `git@host:path` → one argv string.
+  let assert Ok(parser.Expr(parser.Pipeline([
+    parser.Command("git", args, False),
+  ]))) =
+    parser.parse("git clone git@tangled.org:tranquil.farm/tranquil-pds")
+  let assert [
+    parser.ValueArg(parser.Lit(String("clone"))),
+    parser.ValueArg(
+      parser.Lit(String("git@tangled.org:tranquil.farm/tranquil-pds")),
+    ),
+  ] = args
+  Nil
+}
+
 pub fn parse_flake_ref_hash_test() {
   let assert Ok(parser.Expr(parser.Pipeline([
     parser.Command("nix", args, False),
@@ -242,7 +275,7 @@ pub fn eval_pipeline_reverse_first_test() {
 
 /// Pipeline input must become the external's stdin (`cat f | less`, `echo hi | wc`).
 /// Use `let` so the last stage is capture mode even on a TTY (bare expressions
-/// may inherit the terminal and return an empty string value).
+/// inherit the terminal by default and return an empty string value).
 pub fn eval_pipeline_stdin_to_external_test() {
   let env = env.new()
   // `echo` is a builtin; `wc` is external. Count bytes of "hello" (no trailing NL).

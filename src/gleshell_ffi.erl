@@ -428,9 +428,11 @@ run_as_shell(Fun) when is_function(Fun, 0) ->
                     %% competing get_chars clients (killing those dropped the
                     %% first post-command key — empty ↑ after nix/sleep/…).
                     start_stdin_mux(),
+                    enable_bracketed_paste(),
                     try
                         Fun()
                     after
+                        disable_bracketed_paste(),
                         stop_stdin_mux(),
                         save_line_history()
                     end,
@@ -616,6 +618,8 @@ raw_get_line(Prompt) when is_binary(Prompt) ->
     ),
     put(gleshell_history, History),
     put(gleshell_input_rows, 1),
+    put(gleshell_key_q, []),
+    put(gleshell_key_unread, []),
     redraw(PromptList, [], []),
     raw_loop(PromptList, [], [], History, 0, <<>>).
 
@@ -634,9 +638,20 @@ raw_loop(Prompt, Left, Right, History, HistPos, Saved) ->
             io:put_chars("\r\n"),
             push_history(Line),
             {ok, Line};
+        paste_start ->
+            %% Bracketed paste: insert literally (no key bindings), one redraw.
+            NewLeft = read_bracketed_paste(Left),
+            redraw(Prompt, NewLeft, Right),
+            raw_loop(Prompt, NewLeft, Right, History, 0, <<>>);
+        paste_end ->
+            %% Stray end marker (paste not open) — ignore.
+            raw_loop(Prompt, Left, Right, History, HistPos, Saved);
         {char, C} when is_integer(C), C >= 32, C =/= 127 ->
-            %% Printable Unicode codepoint
-            NewLeft = [C | Left],
+            %% Printable Unicode codepoint. Drain any already-queued paste burst
+            %% so we insert every letter and only redraw once (avoids drops when
+            %% a multi-char read or ESC fragment would otherwise lose bytes).
+            Burst = drain_printable_burst(C),
+            NewLeft = lists:reverse(Burst) ++ Left,
             redraw(Prompt, NewLeft, Right),
             raw_loop(Prompt, NewLeft, Right, History, 0, <<>>);
         backspace ->
@@ -1737,37 +1752,80 @@ bin_to_buffer(List) when is_list(List) ->
 %% When the stdin mux is running (raw REPL), all key bytes come from that
 %% process so PTY relay / interrupt watch can retarget without spawning a
 %% second get_chars client (see start_stdin_mux/0).
+%%
+%% Push-back queue (`gleshell_key_q`): codepoints waiting to be consumed.
+%% Critical when a single io payload decodes to multiple characters — the old
+%% `<<C/utf8, _/binary>>` path kept only the first and dropped the rest, which
+%% turned paste bursts like "gleam" into "geam" / "gem" / etc.
 %% ---------------------------------------------------------------------------
 
 read_key() ->
-    case read_key_byte() of
-        eof ->
-            eof;
-        {error, Reason} ->
-            {error, Reason};
-        C when is_integer(C) ->
-            decode_key(C, <<>>)
+    case pop_unread_key() of
+        {ok, K} ->
+            K;
+        empty ->
+            case read_key_byte() of
+                eof ->
+                    eof;
+                {error, Reason} ->
+                    {error, Reason};
+                C when is_integer(C) ->
+                    decode_key(C)
+            end
+    end.
+
+%% Non-blocking: next already-queued codepoint or mux message, else `none`.
+try_read_key_byte() ->
+    case pop_key_q() of
+        {ok, C} ->
+            C;
+        empty ->
+            case get(gleshell_stdin_mux) of
+                Mux when is_pid(Mux) ->
+                    receive
+                        {gleshell_stdin, eof} ->
+                            eof;
+                        {gleshell_stdin, {error, Reason}} ->
+                            {error, Reason};
+                        {gleshell_stdin, Data} ->
+                            case enqueue_key_data(Data) of
+                                empty ->
+                                    try_read_key_byte();
+                                C when is_integer(C) ->
+                                    C
+                            end
+                    after 0 ->
+                        none
+                    end;
+                _ ->
+                    none
+            end
     end.
 
 %% One logical input unit (codepoint or raw byte) for the line editor / CSI.
 read_key_byte() ->
-    case get(gleshell_stdin_mux) of
-        Mux when is_pid(Mux) ->
-            receive
-                {gleshell_stdin, eof} ->
-                    eof;
-                {gleshell_stdin, {error, Reason}} ->
-                    {error, Reason};
-                {gleshell_stdin, Data} ->
-                    case key_data_to_codepoint(Data) of
-                        empty ->
-                            read_key_byte();
-                        C when is_integer(C) ->
-                            C
-                    end
-            end;
-        _ ->
-            read_key_byte_direct()
+    case pop_key_q() of
+        {ok, C} ->
+            C;
+        empty ->
+            case get(gleshell_stdin_mux) of
+                Mux when is_pid(Mux) ->
+                    receive
+                        {gleshell_stdin, eof} ->
+                            eof;
+                        {gleshell_stdin, {error, Reason}} ->
+                            {error, Reason};
+                        {gleshell_stdin, Data} ->
+                            case enqueue_key_data(Data) of
+                                empty ->
+                                    read_key_byte();
+                                C when is_integer(C) ->
+                                    C
+                            end
+                    end;
+                _ ->
+                    read_key_byte_direct()
+            end
     end.
 
 read_key_byte_direct() ->
@@ -1777,7 +1835,7 @@ read_key_byte_direct() ->
         {error, Reason} ->
             {error, Reason};
         Data ->
-            case key_data_to_codepoint(Data) of
+            case enqueue_key_data(Data) of
                 empty ->
                     read_key_byte_direct();
                 C when is_integer(C) ->
@@ -1785,47 +1843,200 @@ read_key_byte_direct() ->
             end
     end.
 
-key_data_to_codepoint(Data) ->
+%% Decode IO data into codepoints: return the first, queue the rest.
+enqueue_key_data(Data) ->
     Bin = io_data_to_bin(Data),
     case Bin of
         <<>> ->
             empty;
-        <<C/utf8, _/binary>> ->
-            C;
-        <<C, _/binary>> when is_integer(C) ->
-            C;
         _ ->
             case unicode:characters_to_list(Bin) of
-                [C | _] when is_integer(C) ->
+                [C | Rest] when is_integer(C) ->
+                    unread_codepoints(Rest),
                     C;
+                [] ->
+                    empty;
+                {incomplete, Done, _Rest} when is_list(Done) ->
+                    case Done of
+                        [C | Rest] when is_integer(C) ->
+                            unread_codepoints(Rest),
+                            C;
+                        [] ->
+                            %% Incomplete UTF-8 lead — keep raw bytes so we do
+                            %% not invent latin1 garbage; wait for more data.
+                            unread_codepoints(binary_to_byte_list(Bin)),
+                            case pop_key_q() of
+                                {ok, C} -> C;
+                                empty -> empty
+                            end;
+                        _ ->
+                            empty
+                    end;
+                {error, Done, _Rest} when is_list(Done) ->
+                    case Done of
+                        [C | Rest] when is_integer(C) ->
+                            unread_codepoints(Rest),
+                            C;
+                        _ ->
+                            fallback_first_byte(Bin)
+                    end;
                 _ ->
-                    empty
+                    fallback_first_byte(Bin)
             end
     end.
 
-decode_key($\r, _) -> enter;
-decode_key($\n, _) -> enter;
-decode_key($\t, _) -> tab;
-decode_key(127, _) -> backspace;
-decode_key($\b, _) -> backspace;
-decode_key(1, _) -> ctrl_a;
-decode_key(5, _) -> ctrl_e;
-decode_key(4, _) -> ctrl_d;
-decode_key(3, _) -> ctrl_c;
-decode_key(11, _) -> ctrl_k;
-decode_key(21, _) -> ctrl_u;
-decode_key(23, _) -> ctrl_w;
-decode_key(12, _) -> ctrl_l;
-decode_key(18, _) -> ctrl_r;
-decode_key(6, _) -> ctrl_f;
-decode_key(16, _) -> ctrl_p;
-decode_key(14, _) -> ctrl_n;
-decode_key(7, _) -> ctrl_g;
-decode_key(?ESC, _) ->
+fallback_first_byte(<<C, Rest/binary>>) when is_integer(C) ->
+    unread_codepoints(binary_to_byte_list(Rest)),
+    C;
+fallback_first_byte(_) ->
+    empty.
+
+binary_to_byte_list(Bin) when is_binary(Bin) ->
+    binary_to_list(Bin).
+
+pop_key_q() ->
+    case get(gleshell_key_q) of
+        [C | Rest] when is_integer(C) ->
+            put(gleshell_key_q, Rest),
+            {ok, C};
+        _ ->
+            put(gleshell_key_q, []),
+            empty
+    end.
+
+%% Prepend so the next pop returns these in order (Cs is chronological).
+unread_codepoints([]) ->
+    ok;
+unread_codepoints(Cs) when is_list(Cs) ->
+    Q =
+        case get(gleshell_key_q) of
+            Q0 when is_list(Q0) -> Q0;
+            _ -> []
+        end,
+    put(gleshell_key_q, Cs ++ Q),
+    ok.
+
+unread_key(Key) ->
+    case get(gleshell_key_unread) of
+        L when is_list(L) ->
+            put(gleshell_key_unread, [Key | L]);
+        _ ->
+            put(gleshell_key_unread, [Key])
+    end.
+
+pop_unread_key() ->
+    case get(gleshell_key_unread) of
+        [K | Rest] ->
+            put(gleshell_key_unread, Rest),
+            {ok, K};
+        _ ->
+            put(gleshell_key_unread, []),
+            empty
+    end.
+
+%% Drain a paste/typeahead burst of printable chars already in the queue/mailbox.
+%% Acc starts with the first char; returns chronological list of codepoints.
+drain_printable_burst(First) when is_integer(First) ->
+    drain_printable_burst_loop([First]).
+
+drain_printable_burst_loop(AccRev) ->
+    case try_next_printable() of
+        {char, C} ->
+            drain_printable_burst_loop([C | AccRev]);
+        none ->
+            %% Brief yield: mux may still be forwarding the rest of a paste.
+            receive
+            after 2 ->
+                case try_next_printable() of
+                    {char, C} ->
+                        drain_printable_burst_loop([C | AccRev]);
+                    none ->
+                        lists:reverse(AccRev)
+                end
+            end
+    end.
+
+try_next_printable() ->
+    case pop_unread_key() of
+        {ok, {char, C}} when is_integer(C), C >= 32, C =/= 127 ->
+            {char, C};
+        {ok, Other} ->
+            unread_key(Other),
+            none;
+        empty ->
+            case try_read_key_byte() of
+                none ->
+                    none;
+                eof ->
+                    unread_key(eof),
+                    none;
+                {error, Reason} ->
+                    unread_key({error, Reason}),
+                    none;
+                C when is_integer(C) ->
+                    case decode_key(C) of
+                        {char, Ch} when is_integer(Ch), Ch >= 32, Ch =/= 127 ->
+                            {char, Ch};
+                        Other ->
+                            unread_key(Other),
+                            none
+                    end
+            end
+    end.
+
+%% Bracketed paste body until paste_end. Newlines → space (single-line editor).
+read_bracketed_paste(Left) ->
+    case read_key() of
+        paste_end ->
+            Left;
+        paste_start ->
+            read_bracketed_paste(Left);
+        {char, C} when is_integer(C), C >= 32, C =/= 127 ->
+            read_bracketed_paste([C | Left]);
+        enter ->
+            read_bracketed_paste([$\s | Left]);
+        eof ->
+            Left;
+        {error, _} ->
+            Left;
+        ctrl_c ->
+            Left;
+        _Other ->
+            read_bracketed_paste(Left)
+    end.
+
+enable_bracketed_paste() ->
+    %% Ask the terminal to wrap pastes in ESC[200~ … ESC[201~.
+    catch io:put_chars("\e[?2004h"),
+    ok.
+
+disable_bracketed_paste() ->
+    catch io:put_chars("\e[?2004l"),
+    ok.
+
+decode_key($\r) -> enter;
+decode_key($\n) -> enter;
+decode_key($\t) -> tab;
+decode_key(127) -> backspace;
+decode_key($\b) -> backspace;
+decode_key(1) -> ctrl_a;
+decode_key(5) -> ctrl_e;
+decode_key(4) -> ctrl_d;
+decode_key(3) -> ctrl_c;
+decode_key(11) -> ctrl_k;
+decode_key(21) -> ctrl_u;
+decode_key(23) -> ctrl_w;
+decode_key(12) -> ctrl_l;
+decode_key(18) -> ctrl_r;
+decode_key(6) -> ctrl_f;
+decode_key(16) -> ctrl_p;
+decode_key(14) -> ctrl_n;
+decode_key(7) -> ctrl_g;
+decode_key(?ESC) ->
     read_escape();
-decode_key(C, _) when is_integer(C), C >= 32 ->
+decode_key(C) when is_integer(C), C >= 32 ->
     {char, C};
-decode_key(_, _) ->
+decode_key(_) ->
     other.
 
 read_escape() ->
@@ -1849,15 +2060,23 @@ read_escape() ->
                 $D -> left;
                 $H -> home;
                 $F -> 'end';
-                _ -> other
+                Other when is_integer(Other) ->
+                    %% Do not drop the follow-up byte (paste / unbound meta).
+                    unread_codepoints([Other]),
+                    other;
+                _ ->
+                    other
             end;
         %% Alt+letter arrives as ESC then the letter (meta).
         $f ->
             alt_f;
         $F ->
             alt_f;
+        C when is_integer(C), C >= 32 ->
+            %% Unbound Alt+key or ESC fragment mid-paste: keep the letter.
+            %% (Old path returned `esc` and *discarded* C — "gleam" → "geam".)
+            {char, C};
         _ ->
-            %% Unknown ESC sequence — Escape is the usual cancel key in TUIs.
             esc
     end.
 
@@ -1884,6 +2103,8 @@ read_csi_params(Acc) ->
                 "6" -> page_down;
                 "7" -> home;
                 "8" -> 'end';
+                "200" -> paste_start;
+                "201" -> paste_end;
                 _ -> other
             end;
         $A ->

@@ -266,10 +266,10 @@ fn print_value(value: value.Value, allow_page: Bool) -> Nil {
     Nothing -> Nil
     _ ->
       // External commands that used PTY relay already streamed output to the
-      // terminal (vim, sudo, …). Skip re-printing when that flag is still set.
-      // Everything else (including systemctl/git/man with nested pagers forced
-      // to cat) is captured and shown here — through the builtin pager when
-      // allowed and the text does not fit on one screen (less -F style).
+      // terminal (servers, vim, sudo, …). Skip re-printing when that flag is
+      // still set. Nested-pager tools (systemctl/git/man) are captured and
+      // shown here — through the builtin pager when allowed and the text does
+      // not fit on one screen (less -F style).
       case sys.take_output_shown() {
         True -> Nil
         False -> {

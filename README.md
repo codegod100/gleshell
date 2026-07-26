@@ -182,11 +182,11 @@ printed without an interactive session. Interactive keys include live `/` search
 (case-insensitive, finds as you type) and `n`/`N` next/previous match. `^less`
 still runs the external binary.
 
-External tools that would spawn system `less` (`systemctl`, `git log`, `man`, …)
-are captured with nested pagers forced to `cat`, then shown through the **same
-builtin pager** when the text does not fit on one screen. Full-screen programs
-that need a real TTY (`vim`, `htop`, `sudo`, `ssh`, …) still inherit the
-terminal. Use `^less` / a path for the external pager binary.
+Most external commands inherit a live TTY so long-lived processes (`nix run`,
+dev servers, builds) stream output as they run. Tools that would spawn system
+`less` (`systemctl`, `git log`, `man`, …) are still captured with nested pagers
+forced to `cat`, then shown through the **same builtin pager** when the text
+does not fit on one screen. Use `^less` / a path for the external pager binary.
 
 Unknown command names fall through to external executables on `PATH`.
 

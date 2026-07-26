@@ -464,5 +464,6 @@ fn is_ident_start(c: String) -> Bool {
 fn is_ident_continue(c: String) -> Bool {
   // Path-ish chars covered by is_ident_start (`.` `/` `~`); keep `-` mid-token.
   // `#` mid-token for flake refs (must match lexer); bare `#` is still a comment.
-  is_ident_start(c) || is_digit(c) || c == "-" || c == "#"
+  // `@` mid-token for SSH/git URLs (must match lexer).
+  is_ident_start(c) || is_digit(c) || c == "-" || c == "#" || c == "@"
 }

@@ -286,5 +286,6 @@ fn is_ident_continue(c: String) -> Bool {
   // Path-ish chars: letters/digits already covered; keep `.` `/` `-` `~` mid-token.
   // `#` mid-token for flake refs (`nixpkgs#hello`, `.#package`); bare `#` still
   // starts a comment at a word boundary (handled in do_tokenize).
-  is_ident_start(c) || is_digit(c) || c == "-" || c == "#"
+  // `@` mid-token for SSH/git URLs (`git@host:path`, `user@host`).
+  is_ident_start(c) || is_digit(c) || c == "-" || c == "#" || c == "@"
 }
