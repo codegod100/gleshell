@@ -81,6 +81,37 @@ pub fn lexer_bare_double_dash_test() {
   Nil
 }
 
+pub fn lexer_flake_ref_hash_test() {
+  // Mid-token `#` is part of the bareword (nix flake refs), not a comment.
+  let assert Ok(tokens) = lexer.tokenize("nix run nixpkgs#hello .#package")
+  let assert [
+    lexer.Ident("nix"),
+    lexer.Ident("run"),
+    lexer.Ident("nixpkgs#hello"),
+    lexer.Ident(".#package"),
+    lexer.Eof,
+  ] = tokens
+  // Leading `#` at a word boundary still starts a line comment.
+  let assert Ok(tokens2) = lexer.tokenize("echo hi # not parsed")
+  let assert [
+    lexer.Ident("echo"),
+    lexer.Ident("hi"),
+    lexer.Eof,
+  ] = tokens2
+  Nil
+}
+
+pub fn parse_flake_ref_hash_test() {
+  let assert Ok(parser.Expr(parser.Pipeline([
+    parser.Command("nix", args, False),
+  ]))) = parser.parse("nix shell nixpkgs#cowsay")
+  let assert [
+    parser.ValueArg(parser.Lit(String("shell"))),
+    parser.ValueArg(parser.Lit(String("nixpkgs#cowsay"))),
+  ] = args
+  Nil
+}
+
 pub fn parse_bare_double_dash_test() {
   let assert Ok(parser.Expr(parser.Pipeline([
     parser.Command("nix", args, False),
@@ -614,6 +645,36 @@ pub fn eval_which_external_test() {
   Nil
 }
 
+pub fn eval_which_follow_test() {
+  let env = env.new()
+  // `-f` follows symlinks to a canonical path (NixOS: sh → bash store path).
+  let assert eval.Continue(_, String(plain)) = eval.eval_source(env, "which sh")
+  let assert eval.Continue(_, String(followed)) =
+    eval.eval_source(env, "which -f sh")
+  // Followed path is absolute and exists; if plain was a symlink, they differ.
+  let assert True = string.starts_with(followed, "/")
+  let assert True = string.length(followed) > 0
+  // Combined with -a: first entry for a non-builtin is still a real path.
+  let assert eval.Continue(_, result) = eval.eval_source(env, "which -a -f sh")
+  case result {
+    String(p) -> {
+      let assert True = string.starts_with(p, "/")
+      Nil
+    }
+    List([String(p), ..]) -> {
+      let assert True = string.starts_with(p, "/")
+      Nil
+    }
+    other -> {
+      let _ = other
+      panic as "which -a -f sh should yield a path"
+    }
+  }
+  let _ = plain
+  let _ = followed
+  Nil
+}
+
 pub fn value_nothing_falsey_test() {
   let assert False = value.is_truthy(Nothing)
   let assert True = value.is_truthy(Int(1))
@@ -686,6 +747,58 @@ pub fn display_size_column_humanized_test() {
   let assert True = string_contains(text, "2 KB")
   let assert False = string_contains(text, "2048")
   Nil
+}
+
+pub fn format_datetime_shape_test() {
+  // Local 12-hour with abbr month: "Nov 14 2023 2:13:20 PM" (example shape).
+  let text = display.format_datetime(1_700_000_000)
+  let assert True = string_contains(text, ":")
+  let assert True =
+    string_contains(text, " AM") || string_contains(text, " PM")
+  let assert True =
+    string_contains(text, "Jan")
+    || string_contains(text, "Feb")
+    || string_contains(text, "Mar")
+    || string_contains(text, "Apr")
+    || string_contains(text, "May")
+    || string_contains(text, "Jun")
+    || string_contains(text, "Jul")
+    || string_contains(text, "Aug")
+    || string_contains(text, "Sep")
+    || string_contains(text, "Oct")
+    || string_contains(text, "Nov")
+    || string_contains(text, "Dec")
+  Nil
+}
+
+pub fn display_modified_column_humanized_test() {
+  // Data stays as Unix seconds; only display shows a local 12-hour datetime.
+  let text =
+    display.render_with(
+      False,
+      Table(["name", "modified"], [[String("a"), Int(1_700_000_000)]]),
+    )
+  let assert False = string_contains(text, "1700000000")
+  let assert True = string_contains(text, ":")
+  let assert True =
+    string_contains(text, " AM") || string_contains(text, " PM")
+  Nil
+}
+
+pub fn ls_includes_modified_column_test() {
+  let env = env.new()
+  // `first` collapses a single row to a record.
+  let assert eval.Continue(_, Record(fields)) =
+    eval.eval_source(env, "ls | first 1")
+  let assert True = list_has_key(fields, "name")
+  let assert True = list_has_key(fields, "type")
+  let assert True = list_has_key(fields, "size")
+  let assert True = list_has_key(fields, "modified")
+  // Pipeline data stays as Int (epoch seconds); display formats it.
+  case list_find_field(fields, "modified") {
+    Ok(Int(n)) if n >= 0 -> Nil
+    _ -> panic as "ls modified should be non-negative Unix epoch seconds"
+  }
 }
 
 pub fn color_visible_length_strips_ansi_test() {
@@ -1212,6 +1325,49 @@ pub fn history_hint_no_match_test() {
   let assert "" = sys.history_hint(hist, "ls")
   // Empty buffer never suggests
   let assert "" = sys.history_hint(hist, "")
+  Nil
+}
+
+// --- Ctrl+R reverse search filter (stinkpot-style fuzzy) ---
+
+pub fn history_search_empty_query_returns_all_test() {
+  let hist = ["ls | first 3", "echo hi", "cd src"]
+  let assert ["ls | first 3", "echo hi", "cd src"] = sys.history_search(hist, "")
+  let assert ["ls | first 3", "echo hi", "cd src"] =
+    sys.history_search(hist, "   ")
+  Nil
+}
+
+pub fn history_search_dedupes_newest_first_test() {
+  let hist = ["echo a", "ls", "echo a", "cd"]
+  let assert ["echo a", "ls", "cd"] = sys.history_search(hist, "")
+  Nil
+}
+
+pub fn history_search_substring_and_fuzzy_test() {
+  let hist = [
+    "gleam test",
+    "ls | where type == file",
+    "git status",
+    "echo hello",
+  ]
+  let hits = sys.history_search(hist, "gleam")
+  let assert True = list_contains(hits, "gleam test")
+  let assert False = list_contains(hits, "git status")
+
+  // Subsequence: "gts" matches "git status"
+  let fuzzy = sys.history_search(hist, "gts")
+  let assert True = list_contains(fuzzy, "git status")
+
+  // Case-insensitive
+  let assert True =
+    list_contains(sys.history_search(hist, "GLEAM"), "gleam test")
+  Nil
+}
+
+pub fn history_search_no_match_test() {
+  let hist = ["ls", "echo hi"]
+  let assert [] = sys.history_search(hist, "zzzz-nope")
   Nil
 }
 

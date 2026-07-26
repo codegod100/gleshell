@@ -4,6 +4,7 @@ import gleam/int
 import gleam/list
 import gleam/string
 import gleshell/color
+import gleshell/sys
 import gleshell/value.{
   type Value, Bool, Fail, Float, Int, List, Nothing, Record, String, Table,
 }
@@ -255,12 +256,19 @@ fn list_index_of_loop(
 }
 
 /// Plain cell text before coloring. Keeps pipeline data as raw ints; only
-/// display converts `size` byte counts to KB/MB/….
+/// display converts `size` byte counts to KB/MB/… and `modified` epoch
+/// seconds to a local datetime.
 fn cell_plain(col: String, value: Value) -> String {
   case col, value {
     "size", Int(n) -> format_filesize(n)
+    "modified", Int(n) -> format_datetime(n)
     _, _ -> value.cell_string(value)
   }
+}
+
+/// Format Unix epoch seconds as local `Jul 3 2026 9:39:40 PM` (12-hour).
+pub fn format_datetime(unix_seconds: Int) -> String {
+  sys.format_unix_local(unix_seconds)
 }
 
 /// Format a byte count for display: B below 1 KiB, then KB / MB / GB / TB
@@ -315,6 +323,7 @@ fn color_cell_for_column(
     "name" -> color_path_name(on, plain, type_hint)
     "type" -> color_entry_type(on, plain)
     "size" -> color.filesize(on, plain)
+    "modified" -> color.datetime(on, plain)
     _ -> color_by_value(on, value, plain)
   }
 }

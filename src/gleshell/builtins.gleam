@@ -284,7 +284,10 @@ fn help_text() -> dict.Dict(String, String) {
     #("help", "help [command] — list builtins, or show help for one command"),
     #("echo", "echo <values>… — emit values (list if multiple)"),
     #("print", "print <values>… — alias for echo"),
-    #("ls", "ls [path] — list directory entries as a table"),
+    #(
+      "ls",
+      "ls [path] — list directory entries as a table (name, type, size, modified)",
+    ),
     #("pwd", "pwd — print working directory"),
     #("cd", "cd [path] — change directory (~ supported)"),
     #(
@@ -341,7 +344,7 @@ fn help_text() -> dict.Dict(String, String) {
     ),
     #(
       "which",
-      "which [-a|--all] <name> — path of command (builtin or on PATH); -a lists all matches",
+      "which [-a|--all] [-f|--follow] <name> — path of command (builtin or on PATH); -a all matches, -f follow symlinks",
     ),
     #("exit", "exit [code] — leave the shell (default code 0)"),
     #("quit", "quit [code] — alias for exit"),
@@ -467,6 +470,7 @@ fn cmd_ls(
                 #("name", String(name)),
                 #("type", String("unknown")),
                 #("size", Int(0)),
+                #("modified", Int(0)),
               ])
             Ok(info) -> {
               let ftype = case simplifile.file_info_type(info) {
@@ -479,6 +483,7 @@ fn cmd_ls(
                 #("name", String(name)),
                 #("type", String(ftype)),
                 #("size", Int(info.size)),
+                #("modified", Int(info.mtime_seconds)),
               ])
             }
           }
@@ -2061,29 +2066,24 @@ fn cmd_which(
   args: List(Value),
   flags: dict.Dict(String, Value),
 ) -> BuiltinResult {
-  // `which -a name` is parsed as FlagArg("a", Some("name")) because the
-  // generic flag parser attaches the next expression as a flag value.
-  // Accept both `which -a name` and `which name -a` / `which --all name`.
-  let #(all, name_opt) = case args {
-    [String(n)] -> #(
-      flag_set(flags, "a") || flag_set(flags, "all"),
-      option.Some(n),
-    )
-    [] ->
-      case dict.get(flags, "a"), dict.get(flags, "all") {
-        Ok(String(n)), _ -> #(True, option.Some(n))
-        _, Ok(String(n)) -> #(True, option.Some(n))
-        Ok(Bool(True)), _ | _, Ok(Bool(True)) -> #(True, option.None)
-        _, _ -> #(False, option.None)
-      }
-    _ -> #(False, option.None)
+  // Boolean flags may steal the next word (`which -a name` → flag a = "name").
+  // Accept `which -a|-f name`, `which name -a|-f`, and long forms.
+  let #(all, stolen_a) = find_bool_flag(flags, ["a", "all"])
+  let #(follow, stolen_f) = find_bool_flag(flags, ["f", "follow"])
+  let name_opt = case list.append(args, list.append(stolen_a, stolen_f)) {
+    [String(n)] -> option.Some(n)
+    [other] -> option.Some(value.as_string(other))
+    _ -> option.None
   }
   case name_opt {
     option.Some(name) -> {
       let is_builtin = dict.has_key(registry(), name)
       case all {
         True -> {
-          let paths = list.map(sys.which_all(name), String)
+          let paths =
+            list.map(sys.which_all(name), fn(p) {
+              String(which_maybe_follow(follow, p))
+            })
           let matches = case is_builtin {
             True -> [String("builtin: " <> name), ..paths]
             False -> paths
@@ -2099,13 +2099,30 @@ fn cmd_which(
             True -> ok(env, String("builtin: " <> name))
             False ->
               case sys.which(name) {
-                Ok(path) -> ok(env, String(path))
+                Ok(path) -> ok(env, String(which_maybe_follow(follow, path)))
                 Error(Nil) -> err(env, "which: " <> name <> " not found")
               }
           }
       }
     }
-    option.None -> err(env, "which: expected name (try `which [-a] <name>`)")
+    option.None ->
+      err(
+        env,
+        "which: expected name (try `which [-a] [-f] <name>`)",
+      )
+  }
+}
+
+/// With `-f`/`--follow`, resolve symlinks to a canonical absolute path.
+/// On failure (broken link, loop), keep the original which path.
+fn which_maybe_follow(follow: Bool, path: String) -> String {
+  case follow {
+    False -> path
+    True ->
+      case sys.realpath(path) {
+        Ok(resolved) -> resolved
+        Error(Nil) -> path
+      }
   }
 }
 

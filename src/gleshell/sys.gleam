@@ -88,6 +88,11 @@ pub fn which(command: String) -> Result(String, Nil)
 @external(erlang, "gleshell_ffi", "which_all")
 pub fn which_all(command: String) -> List(String)
 
+/// Canonical absolute path: resolve `.`/`..` and follow all symlinks.
+/// Error if the path does not exist or the link chain loops / is broken.
+@external(erlang, "gleshell_ffi", "realpath")
+pub fn realpath(path: String) -> Result(String, Nil)
+
 /// True if `text` matches Erlang regex `pattern`. `ignore_case` enables caseless.
 /// Error string on invalid pattern.
 @external(erlang, "gleshell_ffi", "re_contains")
@@ -107,8 +112,19 @@ pub fn complete_word(prefix: String, word: String) -> #(List(String), String)
 @external(erlang, "gleshell_ffi", "history_hint")
 pub fn history_hint(history: List(String), buffer: String) -> String
 
+/// Fuzzy history filter for Ctrl+R reverse search (stinkpot-style).
+/// `history` is newest-first; empty/whitespace `query` returns all unique
+/// entries in that order. Non-empty query returns subsequence fuzzy matches,
+/// best scores first (ties keep newest-first order).
+@external(erlang, "gleshell_ffi", "history_search")
+pub fn history_search(history: List(String), query: String) -> List(String)
+
 @external(erlang, "gleshell_ffi", "home_dir")
 pub fn home_dir() -> Result(String, String)
 
 @external(erlang, "gleshell_ffi", "stdout_isatty")
 pub fn stdout_isatty() -> Bool
+
+/// Format Unix epoch seconds as local `Jul 3 2026 9:39:40 PM` (12-hour).
+@external(erlang, "gleshell_ffi", "format_unix_local")
+pub fn format_unix_local(seconds: Int) -> String

@@ -284,5 +284,7 @@ fn is_ident_start(c: String) -> Bool {
 
 fn is_ident_continue(c: String) -> Bool {
   // Path-ish chars: letters/digits already covered; keep `.` `/` `-` `~` mid-token.
-  is_ident_start(c) || is_digit(c) || c == "-"
+  // `#` mid-token for flake refs (`nixpkgs#hello`, `.#package`); bare `#` still
+  // starts a comment at a word boundary (handled in do_tokenize).
+  is_ident_start(c) || is_digit(c) || c == "-" || c == "#"
 }

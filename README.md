@@ -70,7 +70,7 @@ green, numbers purple, pipes purple, flags blue, variables purple, …).
 | **Tab** | Command completion (builtins + `PATH`) at the start of a pipeline stage; filename completion for arguments (common prefix; list matches if ambiguous) |
 | **→ / Ctrl+F / End / Ctrl+E** (at end of line) | Accept greyed-out history suggestion (full) |
 | **Alt+F** (at end of line) | Accept one word of the history suggestion |
-| **Ctrl+R** | Reverse-i-search through history (Enter accepts onto the line) |
+| **Ctrl+R** | Fuzzy history search (stinkpot-style list; ↑/↓ move, Enter/Tab accept onto the line, Esc cancel) |
 | Ctrl+A / Ctrl+E | Beginning / end of line (Ctrl+E at end also accepts a history hint) |
 | Ctrl+W | Delete previous word |
 | Ctrl+U / Ctrl+K | Kill to start / end of line |
@@ -117,6 +117,7 @@ echo $env.MY_VAR
 ^uname -a
 which ls
 which -a ls
+which -f sh
 ```
 
 ## Language sketch
@@ -134,7 +135,7 @@ which -a ls
 | Env | `$env`, `$env.HOME`, `$env.FOO = value` |
 | Flags | `--flag` / `--flag value` |
 | Force external | `^command args…` |
-| Comments | `# …` |
+| Comments | `# …` (word-boundary only; mid-token `#` is fine — `nixpkgs#pkg`) |
 
 ## Built-ins
 
@@ -162,7 +163,7 @@ Unknown command names fall through to external executables on `PATH`.
 ```text
 src/
   gleshell.gleam          # entry + REPL
-  gleshell_ffi.erl        # line editor (Ctrl+R), cwd, process spawn
+  gleshell_ffi.erl        # line editor (Ctrl+R fuzzy history), cwd, process spawn
   gleshell/
     value.gleam           # structured Value type
     lexer.gleam / parser.gleam

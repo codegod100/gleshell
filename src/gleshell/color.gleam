@@ -143,6 +143,11 @@ pub fn filesize(on: Bool, text: String) -> String {
   paint(on, cyan, text)
 }
 
+/// Datetimes / modified timestamps (dim — secondary metadata).
+pub fn datetime(on: Bool, text: String) -> String {
+  paint(on, dark_gray, text)
+}
+
 pub fn dir_name(on: Bool, text: String) -> String {
   paint(on, bright_blue, text)
 }

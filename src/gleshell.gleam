@@ -65,7 +65,7 @@ fn run_once(code: String) -> Nil {
 
 fn repl(env: env.Env) -> Nil {
   sys.println(
-    "gleshell 0.1 — structured data shell (type `help`, `exit` to quit; Tab completes, grey history hints, Ctrl+R search)",
+    "gleshell 0.1 — structured data shell (type `help`, `exit` to quit; Tab completes, grey history hints, Ctrl+R fuzzy history)",
   )
   repl_loop(env)
 }

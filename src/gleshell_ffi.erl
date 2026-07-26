@@ -15,6 +15,7 @@
     run_cmd_tty/3,
     which/1,
     which_all/1,
+    realpath/1,
     home_dir/0,
     stdout_isatty/0,
     println/1,
@@ -26,12 +27,16 @@
     clear_output_shown/0,
     complete_word/2,
     history_hint/2,
-    re_contains/3
+    history_search/2,
+    re_contains/3,
+    format_unix_local/1
 ]).
 
 -define(ESC, 16#1b).
 -define(CSI_CLEAR_EOL, "\e[K").
 -define(HISTORY_MAX, 2000).
+%% Max rows of history matches shown in the Ctrl+R picker (stinkpot-style).
+-define(SEARCH_MAX_ROWS, 12).
 
 %% ---------------------------------------------------------------------------
 %% Public: write a line (CRLF in raw TTY mode so multi-line output does not
@@ -177,10 +182,16 @@ key_to_name(ctrl_r) ->
     <<"ctrl_r">>;
 key_to_name(ctrl_f) ->
     <<"ctrl_f">>;
+key_to_name(ctrl_p) ->
+    <<"ctrl_p">>;
+key_to_name(ctrl_n) ->
+    <<"ctrl_n">>;
 key_to_name(alt_f) ->
     <<"alt_f">>;
 key_to_name(ctrl_g) ->
     <<"ctrl_g">>;
+key_to_name(esc) ->
+    <<"esc">>;
 key_to_name({char, 32}) ->
     <<"space">>;
 key_to_name({char, C}) when is_integer(C), C >= 32 ->
@@ -587,7 +598,7 @@ raw_loop(Prompt, Left, Right, History, HistPos, Saved) ->
             redraw(Prompt, Left, Right),
             raw_loop(Prompt, Left, Right, History, HistPos, Saved);
         ctrl_r ->
-            reverse_search(Prompt, History);
+            reverse_search(Prompt, Left, Right, History);
         tab ->
             tab_complete(Prompt, Left, Right, History, HistPos, Saved);
         _Other ->
@@ -1001,99 +1012,320 @@ hist_seek_loop(History, Pos, Step, Len) when Pos >= 1, Pos =< Len ->
 hist_seek_loop(_History, _Pos, _Step, _Len) ->
     stay.
 
-%% Minimal Ctrl+R reverse-i-search over history.
-reverse_search(Prompt, History) ->
-    reverse_search_loop(Prompt, History, [], match_history(History, [])).
+%% ---------------------------------------------------------------------------
+%% Ctrl+R reverse history search — stinkpot-style multi-match TUI
+%% (https://tangled.org/oppi.li/stinkpot)
+%%
+%% Fuzzy filter over newest-first history, list up to 12 rows, ↑/↓ move,
+%% Enter/Tab accept onto the line (does not execute), Esc/Ctrl+C/Ctrl+G cancel.
+%% Runs on the alternate screen so the REPL is restored cleanly.
+%% ---------------------------------------------------------------------------
 
-reverse_search_loop(Prompt, History, Query, Match) ->
-    Hint = unicode:characters_to_list(
-        ["(reverse-i-search)`", Query, "': ", Match]
-    ),
-    io:put_chars([$\r, Hint, ?CSI_CLEAR_EOL]),
-    case read_key() of
+reverse_search(Prompt, Left, Right, History) ->
+    %% Seed query from the current buffer (like stinkpot's READLINE_LINE).
+    QueryChars =
+        case unicode:characters_to_list(lists:reverse(Left) ++ Right) of
+            L when is_list(L) -> L;
+            _ -> []
+        end,
+    Candidates = uniq_history(History),
+    Filtered = history_search_filter(Candidates, QueryChars),
+    enter_alt_screen(),
+    Result = reverse_search_loop(Candidates, QueryChars, Filtered, 0),
+    leave_alt_screen(),
+    put(gleshell_input_rows, 1),
+    case Result of
+        {ok, Selected} when is_binary(Selected) ->
+            reverse_search_accept(Prompt, History, Selected);
+        cancel ->
+            redraw(Prompt, Left, Right),
+            raw_loop(Prompt, Left, Right, History, 0, <<>>);
         eof ->
             io:put_chars("\r\n"),
             {error, <<"eof">>};
+        _ ->
+            redraw(Prompt, Left, Right),
+            raw_loop(Prompt, Left, Right, History, 0, <<>>)
+    end.
+
+reverse_search_accept(Prompt, History, Selected) ->
+    case history_blank(Selected) of
+        true ->
+            redraw(Prompt, [], []),
+            raw_loop(Prompt, [], [], History, 0, <<>>);
+        false ->
+            {L, R} = bin_to_buffer(Selected),
+            redraw(Prompt, L, R),
+            raw_loop(Prompt, L, R, History, 0, <<>>)
+    end.
+
+reverse_search_loop(All, Query, Filtered, Cursor0) ->
+    Cursor = clamp_cursor(Cursor0, length(Filtered)),
+    draw_search_ui(Query, Filtered, Cursor),
+    case read_key() of
+        eof ->
+            eof;
+        {error, _} ->
+            eof;
         enter ->
-            %% Accept match onto the edit line; do not submit (edit first).
-            %% Empty match (no query / no hit) — return to an empty draft
-            %% rather than "accepting" a blank line that later looks like a
-            %% phantom history entry when browsing with ↑.
-            Line = iolist_to_binary(Match),
-            case history_blank(Line) of
-                true ->
-                    redraw(Prompt, [], []),
-                    raw_loop(Prompt, [], [], History, 0, <<>>);
-                false ->
-                    {L, R} = bin_to_buffer(Line),
-                    redraw(Prompt, L, R),
-                    raw_loop(Prompt, L, R, History, 0, <<>>)
-            end;
+            pick_filtered(Filtered, Cursor);
+        tab ->
+            pick_filtered(Filtered, Cursor);
+        esc ->
+            cancel;
         ctrl_c ->
-            io:put_chars("\r\n"),
-            redraw(Prompt, [], []),
-            raw_loop(Prompt, [], [], History, 0, <<>>);
+            cancel;
         ctrl_g ->
-            redraw(Prompt, [], []),
-            raw_loop(Prompt, [], [], History, 0, <<>>);
-        ctrl_r ->
-            %% Find older match
-            NewMatch = match_history_after(History, Query, Match),
-            reverse_search_loop(Prompt, History, Query, NewMatch);
-        backspace ->
-            NewQuery = case Query of
-                [] -> [];
-                [_ | _] -> lists:droplast(Query)
-            end,
+            cancel;
+        up ->
+            reverse_search_loop(All, Query, Filtered, max(0, Cursor - 1));
+        ctrl_p ->
+            reverse_search_loop(All, Query, Filtered, max(0, Cursor - 1));
+        down ->
             reverse_search_loop(
-                Prompt, History, NewQuery, match_history(History, NewQuery)
+                All, Query, Filtered, min(length(Filtered) - 1, Cursor + 1)
             );
+        ctrl_n ->
+            reverse_search_loop(
+                All, Query, Filtered, min(length(Filtered) - 1, Cursor + 1)
+            );
+        backspace ->
+            NewQuery =
+                case Query of
+                    [] -> [];
+                    [_ | _] -> lists:droplast(Query)
+                end,
+            NewFiltered = history_search_filter(All, NewQuery),
+            reverse_search_loop(All, NewQuery, NewFiltered, 0);
+        delete ->
+            reverse_search_loop(All, Query, Filtered, Cursor);
         {char, C} when is_integer(C), C >= 32, C =/= 127 ->
             NewQuery = Query ++ [C],
-            reverse_search_loop(
-                Prompt, History, NewQuery, match_history(History, NewQuery)
-            );
+            NewFiltered = history_search_filter(All, NewQuery),
+            reverse_search_loop(All, NewQuery, NewFiltered, 0);
         _ ->
-            reverse_search_loop(Prompt, History, Query, Match)
+            reverse_search_loop(All, Query, Filtered, Cursor)
     end.
 
-match_history(_History, []) ->
-    "";
-match_history(History, Query) ->
-    QBin = unicode:characters_to_binary(Query),
-    case first_match(History, QBin) of
-        undefined -> "";
-        Bin -> unicode:characters_to_list(Bin)
-    end.
+pick_filtered([], _Cursor) ->
+    cancel;
+pick_filtered(Filtered, Cursor) when Cursor >= 0, Cursor < length(Filtered) ->
+    Cmd = lists:nth(Cursor + 1, Filtered),
+    Bin =
+        case Cmd of
+            B when is_binary(B) -> B;
+            L when is_list(L) -> unicode:characters_to_binary(L);
+            _ -> <<>>
+        end,
+    {ok, Bin};
+pick_filtered(_, _) ->
+    cancel.
 
-match_history_after(History, Query, CurrentMatch) ->
-    QBin = unicode:characters_to_binary(Query),
-    CurBin = unicode:characters_to_binary(CurrentMatch),
-    case skip_until_then_match(History, CurBin, QBin, false) of
-        undefined -> CurrentMatch;
-        Bin -> unicode:characters_to_list(Bin)
-    end.
+clamp_cursor(_C, 0) ->
+    0;
+clamp_cursor(C, _Len) when C < 0 ->
+    0;
+clamp_cursor(C, Len) when C >= Len ->
+    Len - 1;
+clamp_cursor(C, _Len) ->
+    C.
 
-first_match([], _) ->
-    undefined;
-first_match([H | T], Q) ->
-    case binary:match(H, Q) of
-        nomatch -> first_match(T, Q);
-        _ -> H
-    end.
+enter_alt_screen() ->
+    io:put_chars("\e[?1049h\e[H\e[2J").
 
-skip_until_then_match([], _Cur, _Q, _Seen) ->
-    undefined;
-skip_until_then_match([H | T], Cur, Q, false) ->
-    case H =:= Cur of
-        true -> skip_until_then_match(T, Cur, Q, true);
-        false -> skip_until_then_match(T, Cur, Q, false)
+leave_alt_screen() ->
+    io:put_chars("\e[?1049l").
+
+draw_search_ui(Query, Filtered, Cursor) ->
+    %% Full repaint from home — alternate screen, so wipe + rewrite is fine.
+    io:put_chars("\e[H\e[J"),
+    QueryLine = search_query_line(Query),
+    io:put_chars([QueryLine, "\r\n"]),
+    Len = length(Filtered),
+    Start =
+        case Cursor >= ?SEARCH_MAX_ROWS of
+            true -> Cursor - ?SEARCH_MAX_ROWS + 1;
+            false -> 0
+        end,
+    End = min(Start + ?SEARCH_MAX_ROWS, Len),
+    draw_search_rows(Filtered, Start, End, Cursor),
+    Footer = search_footer(Len),
+    io:put_chars(Footer),
+    %% Park the cursor at the end of the query line.
+    Col = 2 + length(Query),
+    io:put_chars(["\e[H", "\e[", integer_to_list(Col + 1), $G]).
+
+search_query_line([]) ->
+    case get(gleshell_color) of
+        false ->
+            "> search history...";
+        _ ->
+            ["> ", "\e[2m", "search history...", "\e[0m"]
     end;
-skip_until_then_match([H | T], Cur, Q, true) ->
-    case binary:match(H, Q) of
-        nomatch -> skip_until_then_match(T, Cur, Q, true);
-        _ -> H
+search_query_line(Query) when is_list(Query) ->
+    ["> ", Query].
+
+draw_search_rows(_Filtered, Start, End, _Cursor) when Start >= End ->
+    ok;
+draw_search_rows(Filtered, Start, End, Cursor) ->
+    draw_search_rows_loop(Filtered, Start, End, Cursor).
+
+draw_search_rows_loop(_Filtered, I, End, _Cursor) when I >= End ->
+    ok;
+draw_search_rows_loop(Filtered, I, End, Cursor) ->
+    Cmd0 = lists:nth(I + 1, Filtered),
+    CmdList =
+        case Cmd0 of
+            Bin when is_binary(Bin) ->
+                case unicode:characters_to_list(Bin) of
+                    L when is_list(L) -> L;
+                    _ -> []
+                end;
+            L when is_list(L) -> L;
+            _ -> []
+        end,
+    %% Flatten newlines so a multi-line history entry stays one row.
+    Line = [case C of $\n -> $\s; $\r -> $\s; _ -> C end || C <- CmdList],
+    case I =:= Cursor of
+        true ->
+            case get(gleshell_color) of
+                false ->
+                    io:put_chars(["  ", Line, "\r\n"]);
+                _ ->
+                    %% Bold blue — stinkpot styleCursor (lipgloss color "4").
+                    io:put_chars(["  ", "\e[1;34m", Line, "\e[0m", "\r\n"])
+            end;
+        false ->
+            io:put_chars(["  ", Line, "\r\n"])
+    end,
+    draw_search_rows_loop(Filtered, I + 1, End, Cursor).
+
+search_footer(N) ->
+    %% Unicode arrows match stinkpot's footer copy.
+    Text = [
+        "  ",
+        integer_to_list(N),
+        " matches · ↑/↓ move · enter accept · esc cancel"
+    ],
+    case get(gleshell_color) of
+        false ->
+            Text;
+        _ ->
+            ["\e[2m", Text, "\e[0m"]
     end.
+
+%% Dedupe history preserving newest-first order (stinkpot stores unique cmds).
+uniq_history(Hist) when is_list(Hist) ->
+    uniq_history(Hist, #{}, []);
+uniq_history(_) ->
+    [].
+
+uniq_history([], _Seen, Acc) ->
+    lists:reverse(Acc);
+uniq_history([H | T], Seen, Acc) ->
+    Key =
+        case H of
+            B when is_binary(B) -> B;
+            L when is_list(L) -> unicode:characters_to_binary(L);
+            _ -> <<>>
+        end,
+    case history_blank(Key) orelse maps:is_key(Key, Seen) of
+        true ->
+            uniq_history(T, Seen, Acc);
+        false ->
+            uniq_history(T, Seen#{Key => true}, [Key | Acc])
+    end.
+
+%% Test helper / filter: history (newest first binaries) + query → filtered list.
+-spec history_search(list(binary()), binary()) -> list(binary()).
+history_search(History, Query) when is_list(History), is_binary(Query) ->
+    QList =
+        case unicode:characters_to_list(Query) of
+            L when is_list(L) -> L;
+            _ -> []
+        end,
+    history_search_filter(uniq_history(History), QList);
+history_search(_, _) ->
+    [].
+
+%% Empty / whitespace-only query → all candidates (newest first).
+%% Otherwise fuzzy subsequence match (case-insensitive), best scores first;
+%% ties keep newest-first order via stable index.
+history_search_filter(Candidates, Query) when is_list(Candidates), is_list(Query) ->
+    case string:trim(Query) of
+        [] ->
+            Candidates;
+        QTrim ->
+            QLower = to_lower_chars(QTrim),
+            Scored = score_candidates(Candidates, QLower, 0, []),
+            Sorted = lists:sort(
+                fun({Sa, Ia, _}, {Sb, Ib, _}) ->
+                    case Sa =:= Sb of
+                        true -> Ia =< Ib;
+                        false -> Sa > Sb
+                    end
+                end,
+                Scored
+            ),
+            [Cmd || {_S, _I, Cmd} <- Sorted]
+    end;
+history_search_filter(_, _) ->
+    [].
+
+score_candidates([], _Q, _I, Acc) ->
+    Acc;
+score_candidates([Cmd | Rest], Q, I, Acc) ->
+    CmdList =
+        case Cmd of
+            Bin when is_binary(Bin) ->
+                case unicode:characters_to_list(Bin) of
+                    L when is_list(L) -> L;
+                    _ -> []
+                end;
+            L when is_list(L) -> L;
+            _ -> []
+        end,
+    case fuzzy_score(Q, to_lower_chars(CmdList)) of
+        nomatch ->
+            score_candidates(Rest, Q, I + 1, Acc);
+        Score when is_integer(Score) ->
+            score_candidates(Rest, Q, I + 1, [{Score, I, Cmd} | Acc])
+    end.
+
+%% Case-insensitive subsequence fuzzy score (inspired by sahilm/fuzzy used by
+%% stinkpot). Higher is better. Consecutive matches and early matches score up.
+fuzzy_score([], _Cand) ->
+    0;
+fuzzy_score(Query, Cand) ->
+    fuzzy_score(Query, Cand, 0, 0, -2, 0).
+
+fuzzy_score([], _Cand, Score, _Idx, _Last, _Run) ->
+    Score;
+fuzzy_score([_ | _], [], _Score, _Idx, _Last, _Run) ->
+    nomatch;
+fuzzy_score([Q | Qs], [C | Cs], Score, Idx, Last, Run) when Q =:= C ->
+    Consecutive =
+        case Idx =:= Last + 1 of
+            true -> Run + 1;
+            false -> 0
+        end,
+    %% Base hit + bonus for runs; slight preference for earlier positions.
+    Bonus = Consecutive * 4,
+    Early = max(0, 32 - Idx),
+    fuzzy_score(Qs, Cs, Score + 16 + Bonus + Early, Idx + 1, Idx, Consecutive);
+fuzzy_score(Q, [_ | Cs], Score, Idx, Last, _Run) ->
+    fuzzy_score(Q, Cs, Score, Idx + 1, Last, 0).
+
+to_lower_chars(List) when is_list(List) ->
+    [
+        case C of
+            X when is_integer(X), X >= $A, X =< $Z -> X + 32;
+            X -> X
+        end
+     || C <- List
+    ];
+to_lower_chars(_) ->
+    [].
 
 kill_word([]) ->
     {[], []};
@@ -1391,6 +1623,9 @@ decode_key(23, _) -> ctrl_w;
 decode_key(12, _) -> ctrl_l;
 decode_key(18, _) -> ctrl_r;
 decode_key(6, _) -> ctrl_f;
+decode_key(16, _) -> ctrl_p;
+decode_key(14, _) -> ctrl_n;
+decode_key(7, _) -> ctrl_g;
 decode_key(?ESC, _) ->
     read_escape();
 decode_key(C, _) when is_integer(C), C >= 32 ->
@@ -1401,7 +1636,11 @@ decode_key(_, _) ->
 read_escape() ->
     case io:get_chars("", 1) of
         eof ->
-            other;
+            %% Lone ESC (no follow-up) — treat as Escape.
+            esc;
+        <<?ESC>> ->
+            %% ESC ESC
+            esc;
         <<"[">> ->
             read_csi();
         <<$O>> ->
@@ -1421,7 +1660,8 @@ read_escape() ->
         <<$F>> ->
             alt_f;
         _ ->
-            other
+            %% Unknown ESC sequence — Escape is the usual cancel key in TUIs.
+            esc
     end.
 
 read_csi() ->
@@ -1748,6 +1988,46 @@ is_executable_file(Path) ->
             (Mode band 8#111) =/= 0;
         _ ->
             false
+    end.
+
+%% Canonical absolute path: resolve `.`/`..` and follow symlinks (like realpath(3)).
+%% On failure (missing path, loop, etc.) returns {error, nil}.
+-spec realpath(binary()) -> {ok, binary()} | {error, nil}.
+realpath(Path) when is_binary(Path) ->
+    case realpath_loop(unicode:characters_to_list(Path), #{}) of
+        {ok, Resolved} ->
+            {ok, unicode:characters_to_binary(Resolved)};
+        {error, _} ->
+            {error, nil}
+    end.
+
+realpath_loop(Path, Seen) ->
+    Abs = filename:absname(Path),
+    case maps:is_key(Abs, Seen) of
+        true ->
+            {error, eloop};
+        false ->
+            case file:read_link(Abs) of
+                {ok, Target} ->
+                    Next =
+                        case filename:pathtype(Target) of
+                            absolute ->
+                                Target;
+                            _ ->
+                                filename:absname(filename:join(filename:dirname(Abs), Target))
+                        end,
+                    realpath_loop(Next, Seen#{Abs => true});
+                {error, einval} ->
+                    %% Not a symlink — Abs is the final path.
+                    case file:read_file_info(Abs) of
+                        {ok, _} ->
+                            {ok, Abs};
+                        {error, Reason} ->
+                            {error, Reason}
+                    end;
+                {error, Reason} ->
+                    {error, Reason}
+            end
     end.
 
 -spec home_dir() -> {ok, binary()} | {error, binary()}.
@@ -2906,3 +3186,48 @@ reason_to_bin(Reason) when is_binary(Reason) ->
     Reason;
 reason_to_bin(Reason) ->
     iolist_to_binary(io_lib:format("~p", [Reason])).
+
+%% ---------------------------------------------------------------------------
+%% Format Unix epoch seconds as local calendar time:
+%% "Jul 3 2026 9:39:40 PM" (abbreviated month, 12-hour clock).
+%% Used for `ls` modified column display (data stays as raw Int).
+%% ---------------------------------------------------------------------------
+
+-spec format_unix_local(integer()) -> binary().
+format_unix_local(Seconds) when is_integer(Seconds) ->
+    try
+        {{Y, Mo, D}, {H, Mi, S}} =
+            calendar:system_time_to_local_time(Seconds, second),
+        {H12, AmPm} = to_12h(H),
+        iolist_to_binary(
+            io_lib:format(
+                "~s ~B ~4..0B ~B:~2..0B:~2..0B ~s",
+                [month_abbr(Mo), D, Y, H12, Mi, S, AmPm]
+            )
+        )
+    catch
+        _:_ ->
+            integer_to_binary(Seconds)
+    end;
+format_unix_local(_) ->
+    <<"0">>.
+
+%% 0 → 12 AM, 1–11 → AM, 12 → 12 PM, 13–23 → 1–11 PM
+to_12h(0) -> {12, "AM"};
+to_12h(H) when H < 12 -> {H, "AM"};
+to_12h(12) -> {12, "PM"};
+to_12h(H) -> {H - 12, "PM"}.
+
+month_abbr(1) -> "Jan";
+month_abbr(2) -> "Feb";
+month_abbr(3) -> "Mar";
+month_abbr(4) -> "Apr";
+month_abbr(5) -> "May";
+month_abbr(6) -> "Jun";
+month_abbr(7) -> "Jul";
+month_abbr(8) -> "Aug";
+month_abbr(9) -> "Sep";
+month_abbr(10) -> "Oct";
+month_abbr(11) -> "Nov";
+month_abbr(12) -> "Dec";
+month_abbr(_) -> "???".
