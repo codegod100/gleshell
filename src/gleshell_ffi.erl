@@ -423,9 +423,15 @@ run_as_shell(Fun) when is_function(Fun, 0) ->
                     put(gleshell_raw, true),
                     load_line_history(),
                     configure_line_editor(),
+                    %% One long-lived stdin owner for the raw REPL. External
+                    %% PTY/interrupt helpers retarget it instead of spawning
+                    %% competing get_chars clients (killing those dropped the
+                    %% first post-command key — empty ↑ after nix/sleep/…).
+                    start_stdin_mux(),
                     try
                         Fun()
                     after
+                        stop_stdin_mux(),
                         save_line_history()
                     end,
                     nil;
@@ -1727,27 +1733,74 @@ bin_to_buffer(List) when is_list(List) ->
 
 %% ---------------------------------------------------------------------------
 %% Key reading (raw mode — keys arrive as soon as pressed)
+%%
+%% When the stdin mux is running (raw REPL), all key bytes come from that
+%% process so PTY relay / interrupt watch can retarget without spawning a
+%% second get_chars client (see start_stdin_mux/0).
 %% ---------------------------------------------------------------------------
 
 read_key() ->
+    case read_key_byte() of
+        eof ->
+            eof;
+        {error, Reason} ->
+            {error, Reason};
+        C when is_integer(C) ->
+            decode_key(C, <<>>)
+    end.
+
+%% One logical input unit (codepoint or raw byte) for the line editor / CSI.
+read_key_byte() ->
+    case get(gleshell_stdin_mux) of
+        Mux when is_pid(Mux) ->
+            receive
+                {gleshell_stdin, eof} ->
+                    eof;
+                {gleshell_stdin, {error, Reason}} ->
+                    {error, Reason};
+                {gleshell_stdin, Data} ->
+                    case key_data_to_codepoint(Data) of
+                        empty ->
+                            read_key_byte();
+                        C when is_integer(C) ->
+                            C
+                    end
+            end;
+        _ ->
+            read_key_byte_direct()
+    end.
+
+read_key_byte_direct() ->
     case io:get_chars("", 1) of
         eof ->
             eof;
         {error, Reason} ->
             {error, Reason};
-        <<C/utf8>> ->
-            decode_key(C, <<>>);
-        [C] when is_integer(C) ->
-            decode_key(C, <<>>);
-        Bin when is_binary(Bin), byte_size(Bin) > 0 ->
-            case unicode:characters_to_list(Bin) of
-                [C | _] -> decode_key(C, <<>>);
-                _ -> read_key()
-            end;
-        List when is_list(List), List =/= [] ->
-            decode_key(hd(List), <<>>);
+        Data ->
+            case key_data_to_codepoint(Data) of
+                empty ->
+                    read_key_byte_direct();
+                C when is_integer(C) ->
+                    C
+            end
+    end.
+
+key_data_to_codepoint(Data) ->
+    Bin = io_data_to_bin(Data),
+    case Bin of
+        <<>> ->
+            empty;
+        <<C/utf8, _/binary>> ->
+            C;
+        <<C, _/binary>> when is_integer(C) ->
+            C;
         _ ->
-            read_key()
+            case unicode:characters_to_list(Bin) of
+                [C | _] when is_integer(C) ->
+                    C;
+                _ ->
+                    empty
+            end
     end.
 
 decode_key($\r, _) -> enter;
@@ -1776,30 +1829,32 @@ decode_key(_, _) ->
     other.
 
 read_escape() ->
-    case io:get_chars("", 1) of
+    case read_key_byte() of
         eof ->
             %% Lone ESC (no follow-up) — treat as Escape.
             esc;
-        <<?ESC>> ->
+        {error, _} ->
+            esc;
+        ?ESC ->
             %% ESC ESC
             esc;
-        <<"[">> ->
+        $[ ->
             read_csi();
-        <<$O>> ->
+        $O ->
             %% SS3 sequences: OH = home, OF = end, OA/OB/OC/OD arrows
-            case io:get_chars("", 1) of
-                <<"A">> -> up;
-                <<"B">> -> down;
-                <<"C">> -> right;
-                <<"D">> -> left;
-                <<"H">> -> home;
-                <<"F">> -> 'end';
+            case read_key_byte() of
+                $A -> up;
+                $B -> down;
+                $C -> right;
+                $D -> left;
+                $H -> home;
+                $F -> 'end';
                 _ -> other
             end;
         %% Alt+letter arrives as ESC then the letter (meta).
-        <<$f>> ->
+        $f ->
             alt_f;
-        <<$F>> ->
+        $F ->
             alt_f;
         _ ->
             %% Unknown ESC sequence — Escape is the usual cancel key in TUIs.
@@ -1810,14 +1865,16 @@ read_csi() ->
     read_csi_params([]).
 
 read_csi_params(Acc) ->
-    case io:get_chars("", 1) of
+    case read_key_byte() of
         eof ->
             other;
-        <<C/utf8>> when C >= $0, C =< $9 ->
+        {error, _} ->
+            other;
+        C when is_integer(C), C >= $0, C =< $9 ->
             read_csi_params([C | Acc]);
-        <<$;>> ->
+        $; ->
             read_csi_params([$; | Acc]);
-        <<$~>> ->
+        $~ ->
             Params = lists:reverse(Acc),
             case Params of
                 "1" -> home;
@@ -1829,21 +1886,144 @@ read_csi_params(Acc) ->
                 "8" -> 'end';
                 _ -> other
             end;
-        <<"A">> ->
+        $A ->
             up;
-        <<"B">> ->
+        $B ->
             down;
-        <<"C">> ->
+        $C ->
             right;
-        <<"D">> ->
+        $D ->
             left;
-        <<"H">> ->
+        $H ->
             home;
-        <<"F">> ->
+        $F ->
             'end';
         _ ->
             other
     end.
+
+%% ---------------------------------------------------------------------------
+%% Stdin mux — single get_chars owner for the raw REPL
+%%
+%% Target:
+%%   line                 → forward bytes to the shell process (line editor)
+%%   {port, Port}         → relay into a child PTY (interactive externals)
+%%   {interrupt, Parent}  → Ctrl+C → interrupt msg; other keys become typeahead
+%%
+%% Retarget with set_stdin_target/1. The mux applies pending retargets *after*
+%% each get_chars returns and *before* routing, so the first key after a
+%% command is not lost to a dead Port or a killed get_chars client.
+%% ---------------------------------------------------------------------------
+
+start_stdin_mux() ->
+    case get(gleshell_stdin_mux) of
+        Pid when is_pid(Pid) ->
+            Pid;
+        _ ->
+            Owner = self(),
+            GL = group_leader(),
+            Mux = spawn(fun() ->
+                group_leader(GL, self()),
+                stdin_mux_loop(Owner, line, [])
+            end),
+            put(gleshell_stdin_mux, Mux),
+            Mux
+    end.
+
+stop_stdin_mux() ->
+    case erase(gleshell_stdin_mux) of
+        Pid when is_pid(Pid) ->
+            Pid ! stop,
+            ok;
+        _ ->
+            ok
+    end.
+
+set_stdin_target(Target) ->
+    case get(gleshell_stdin_mux) of
+        Pid when is_pid(Pid) ->
+            Pid ! {set_target, Target},
+            ok;
+        _ ->
+            ok
+    end.
+
+stdin_mux_loop(Owner, Target, Typeahead) ->
+    %% Deliver queued typeahead to the line editor before blocking again.
+    case {Target, Typeahead} of
+        {line, [Bin | Rest]} when is_binary(Bin) ->
+            Owner ! {gleshell_stdin, Bin},
+            stdin_mux_loop(Owner, line, Rest);
+        _ ->
+            case io:get_chars("", 1) of
+                eof ->
+                    {NewT, NewTA} = drain_mux_controls(Target, Typeahead),
+                    case NewT of
+                        line ->
+                            Owner ! {gleshell_stdin, eof};
+                        _ ->
+                            ok
+                    end,
+                    stdin_mux_loop(Owner, NewT, NewTA);
+                {error, Reason} ->
+                    {NewT, NewTA} = drain_mux_controls(Target, Typeahead),
+                    case NewT of
+                        line ->
+                            Owner ! {gleshell_stdin, {error, Reason}};
+                        _ ->
+                            ok
+                    end,
+                    stdin_mux_loop(Owner, NewT, NewTA);
+                Data ->
+                    Bin0 = io_data_to_bin(Data),
+                    {NewT, NewTA0} = drain_mux_controls(Target, Typeahead),
+                    case Bin0 of
+                        <<>> ->
+                            stdin_mux_loop(Owner, NewT, NewTA0);
+                        Bin ->
+                            case NewT of
+                                line ->
+                                    %% Typeahead (from interrupt mode) first, then
+                                    %% this key — loop head delivers in order.
+                                    stdin_mux_loop(Owner, line, NewTA0 ++ [Bin]);
+                                {port, Port} ->
+                                    mux_relay_port(Port, Bin),
+                                    stdin_mux_loop(Owner, NewT, NewTA0);
+                                {interrupt, Parent} ->
+                                    NewTA1 = mux_interrupt_key(Parent, Bin, NewTA0),
+                                    stdin_mux_loop(Owner, NewT, NewTA1);
+                                _ ->
+                                    stdin_mux_loop(Owner, NewT, NewTA0)
+                            end
+                    end
+            end
+    end.
+
+%% Apply all pending {set_target, _} / stop messages (non-blocking).
+drain_mux_controls(Target, Typeahead) ->
+    receive
+        stop ->
+            exit(normal);
+        {set_target, NewTarget} ->
+            drain_mux_controls(NewTarget, Typeahead)
+    after 0 ->
+        {Target, Typeahead}
+    end.
+
+mux_relay_port(Port, <<3>> = Bin) ->
+    signal_port_group(Port, int),
+    catch port_command(Port, Bin),
+    ok;
+mux_relay_port(Port, Bin) ->
+    catch port_command(Port, Bin),
+    ok.
+
+mux_interrupt_key(Parent, <<3>>, Typeahead) ->
+    Parent ! {gleshell_interrupt, mux},
+    Typeahead;
+mux_interrupt_key(_Parent, Bin, Typeahead) ->
+    %% Preserve typeahead typed while a capture-mode external runs.
+    Typeahead ++ [Bin].
 
 %% ---------------------------------------------------------------------------
 %% History persistence
@@ -2438,8 +2618,14 @@ run_cmd_capture_pipe(Path, PortArgs, Stdin) when is_binary(Stdin) ->
 
 %% PTY capture: child sees a TTY (colors, auto decorations) but we only collect
 %% output — nothing is relayed to the user's terminal.
+%%
+%% Always use a one-shot runner so we can `stty` the slave to the host size.
+%% `script` PTYs start at 0×0 when Erlang's port is not a real TTY, which makes
+%% systemctl/less/… truncate and paginate as if the window were tiny.
 run_cmd_capture_pty(Script, Path, PortArgs, <<>>) ->
-    run_cmd_capture_pty_argv(Script, [Path | PortArgs]);
+    with_exec_runner(Path, PortArgs, undefined, fun(Runner) ->
+        run_cmd_capture_pty_argv(Script, [Runner])
+    end);
 run_cmd_capture_pty(Script, Path, PortArgs, Stdin) when is_binary(Stdin) ->
     with_stdin_file(Stdin, fun(StdinPath) ->
         with_exec_runner(Path, PortArgs, StdinPath, fun(Runner) ->
@@ -2512,11 +2698,15 @@ run_cmd_inherit(Path, PortArgs, Stdin) when is_binary(Stdin) ->
 %% `sh -c 'exec "$0" …' path` therefore becomes one mangled shell string and
 %% the real binary never runs (fastfetch → empty output, exit 0).
 %%
-%% Empty stdin: pass Path/args through as simple tokens (`script -- cmd args`).
-%% Non-empty stdin (pipeline → less): write a one-shot runner script that
-%% redirects and execs, then `script -- /tmp/runner` (single path token).
+%% Always write a one-shot runner (single path token for `script --`):
+%%   1. `stty rows/columns` to the host size (PTY otherwise stays 0×0)
+%%   2. `exec` the real command
+%% Non-empty stdin (pipeline → less): also redirect stdin from the temp file.
+%% Empty stdin: leave stdin on the PTY so key relay still reaches the child.
 run_cmd_pty(Script, Path, PortArgs, TtyPath, <<>>) ->
-    run_cmd_pty_argv(Script, [Path | PortArgs], TtyPath, Path, PortArgs, <<>>);
+    with_exec_runner(Path, PortArgs, undefined, fun(Runner) ->
+        run_cmd_pty_argv(Script, [Runner], TtyPath, Path, PortArgs, <<>>)
+    end);
 run_cmd_pty(Script, Path, PortArgs, TtyPath, Stdin) when is_binary(Stdin) ->
     with_stdin_file(Stdin, fun(StdinPath) ->
         with_exec_runner(Path, PortArgs, StdinPath, fun(Runner) ->
@@ -2540,18 +2730,33 @@ run_cmd_pty_argv(Script, Argv, TtyPath, Path, PortArgs, Stdin) when is_list(Argv
         ),
         case file:open(TtyPath, [write, raw, binary]) of
             {ok, TtyOut} ->
-                GL = group_leader(),
-                Reader = spawn(fun() ->
-                    group_leader(GL, self()),
-                    io_to_port(Port)
-                end),
                 put(gleshell_output_shown, true),
-                try
-                    collect_output_relay(Port, TtyOut, <<>>)
-                after
-                    exit(Reader, kill),
-                    catch file:close(TtyOut),
-                    catch port_close(Port)
+                case get(gleshell_stdin_mux) of
+                    Mux when is_pid(Mux) ->
+                        %% Prefer the long-lived mux: retarget to Port, never
+                        %% kill a get_chars client (that stole the next ↑).
+                        set_stdin_target({port, Port}),
+                        try
+                            collect_output_relay(Port, TtyOut, <<>>)
+                        after
+                            set_stdin_target(line),
+                            catch file:close(TtyOut),
+                            catch port_close(Port)
+                        end;
+                    _ ->
+                        %% Non-raw / no mux: legacy per-command reader.
+                        GL = group_leader(),
+                        Reader = spawn(fun() ->
+                            group_leader(GL, self()),
+                            io_to_port(Port)
+                        end),
+                        try
+                            collect_output_relay(Port, TtyOut, <<>>)
+                        after
+                            stop_io_client(Reader),
+                            catch file:close(TtyOut),
+                            catch port_close(Port)
+                        end
                 end;
             {error, _} ->
                 catch port_close(Port),
@@ -2603,17 +2808,87 @@ write_runner_script(Path, PortArgs, StdinPath) ->
             E
     end.
 
-runner_script_body(Path, PortArgs, StdinPath) ->
+%% One-shot runner body. StdinPath = undefined keeps stdin on the PTY (keys);
+%% a filesystem path redirects stdin (pipeline data). Always size the slave
+%% first: script(1) PTYs under Erlang ports report 0×0 without this.
+runner_script_body(CmdPath, PortArgs, StdinPath) ->
+    {Rows, Cols} = host_term_dims(),
+    Stty =
+        case Rows > 0 andalso Cols > 0 of
+            true ->
+                [
+                    "stty rows ",
+                    integer_to_list(Rows),
+                    " columns ",
+                    integer_to_list(Cols),
+                    " 2>/dev/null\n"
+                ];
+            false ->
+                []
+        end,
     ArgsQ = [[$\s, shell_single_quote(A)] || A <- PortArgs],
+    Redirect =
+        case StdinPath of
+            undefined ->
+                [];
+            Sp when is_list(Sp) ->
+                [" < ", shell_single_quote(Sp)];
+            Sp when is_binary(Sp) ->
+                [" < ", shell_single_quote(Sp)]
+        end,
     [
         "#!/bin/sh\n",
+        Stty,
         "exec ",
-        shell_single_quote(Path),
+        shell_single_quote(CmdPath),
         ArgsQ,
-        " < ",
-        shell_single_quote(StdinPath),
+        Redirect,
         "\n"
     ].
+
+%% Host terminal dimensions for child PTY `stty` and COLUMNS/LINES.
+%% Prefer `stty size` on the real TTY device (ground truth). Erlang's
+%% io:rows/columns often fail outside raw REPL and term_size/0 then returns
+%% the 24×80 placeholders — which made systemctl truncate wide terminals.
+host_term_dims() ->
+    case stty_host_size() of
+        {ok, R, C} ->
+            {R, C};
+        _ ->
+            case term_size() of
+                {ok, {R, C}} when is_integer(R), R > 0, is_integer(C), C > 0 ->
+                    {R, C};
+                _ ->
+                    {24, 80}
+            end
+    end.
+
+%% Parse `stty size` → {ok, Rows, Cols}. Uses the same device probe as stty_run
+%% (concrete pts, then /dev/tty) so we work even when stdout is a pipe.
+stty_host_size() ->
+    case stty_run(["size"]) of
+        {ok, Out} ->
+            case string:tokens(string:trim(Out, both, [$\s, $\t, $\n, $\r]), " \t") of
+                [Rs, Cs] ->
+                    try
+                        R = list_to_integer(Rs),
+                        C = list_to_integer(Cs),
+                        case R > 0 andalso C > 0 of
+                            true ->
+                                {ok, R, C};
+                            false ->
+                                error
+                        end
+                    catch
+                        _:_ ->
+                            error
+                    end;
+                _ ->
+                    error
+            end;
+        _ ->
+            error
+    end.
 
 %% Safe single-quoted shell token (`foo'bar` → `'foo'\''bar'`).
 shell_single_quote(S) when is_list(S) ->
@@ -2704,6 +2979,7 @@ write_stdin_tmp(Data) when is_binary(Data) ->
     end.
 
 %% Relay keypresses from the group leader to the child's PTY (script stdin).
+%% Used only when the stdin mux is unavailable (non-raw fallback).
 %% Ctrl+C (ETX / byte 3): SIGINT the child process group, and still write the
 %% byte so the PTY line discipline can deliver SIGINT on the slave side too.
 io_to_port(Port) ->
@@ -2725,6 +3001,25 @@ io_to_port(Port) ->
                     io_to_port(Port)
             end
     end.
+
+%% Kill a short-lived get_chars client and wait until it is gone so the next
+%% REPL read is less likely to race an orphaned I/O request.
+stop_io_client(Pid) when is_pid(Pid) ->
+    case is_process_alive(Pid) of
+        false ->
+            ok;
+        true ->
+            MRef = erlang:monitor(process, Pid),
+            exit(Pid, kill),
+            receive
+                {'DOWN', MRef, process, Pid, _} ->
+                    ok
+            after 1000 ->
+                ok
+            end
+    end;
+stop_io_client(_) ->
+    ok.
 
 io_data_to_bin(Bin) when is_binary(Bin) ->
     Bin;
@@ -2882,8 +3177,12 @@ collect_output_relay(Port, Tty, Acc) ->
             _ = file:write(Tty, Bin),
             collect_output_relay(Port, Tty, <<Acc/binary, Bin/binary>>);
         {Port, {exit_status, Status}} ->
+            %% Retarget stdin immediately so the first post-command key is not
+            %% relayed into the dead Port (looked like empty ↑ history).
+            set_stdin_target(line),
             {ok, {Status, normalize_pty_output(Acc)}};
         {'EXIT', Port, _Reason} ->
+            set_stdin_target(line),
             {ok, {130, normalize_pty_output(Acc)}};
         {gleshell_interrupt, _} ->
             signal_port_group(Port, int),
@@ -2904,8 +3203,10 @@ collect_output_relay_after_interrupt(Port, Tty, Acc, GraceMs) ->
                 Port, Tty, <<Acc/binary, Bin/binary>>, GraceMs
             );
         {Port, {exit_status, Status}} ->
+            set_stdin_target(line),
             {ok, {Status, normalize_pty_output(Acc)}};
         {'EXIT', Port, _Reason} ->
+            set_stdin_target(line),
             {ok, {130, normalize_pty_output(Acc)}};
         {gleshell_interrupt, _} ->
             signal_port_group(Port, kill),
@@ -2915,10 +3216,13 @@ collect_output_relay_after_interrupt(Port, Tty, Acc, GraceMs) ->
         catch port_close(Port),
         receive
             {Port, {exit_status, Status}} ->
+                set_stdin_target(line),
                 {ok, {Status, normalize_pty_output(Acc)}};
             {'EXIT', Port, _} ->
+                set_stdin_target(line),
                 {ok, {130, normalize_pty_output(Acc)}}
         after 1000 ->
+            set_stdin_target(line),
             {ok, {130, normalize_pty_output(Acc)}}
         end
     end.
@@ -2933,27 +3237,31 @@ collect_output_relay_after_interrupt(Port, Tty, Acc, GraceMs) ->
 
 with_interrupt_watch(_Port, Fun) when is_function(Fun, 0) ->
     Parent = self(),
-    GL = group_leader(),
-    Watcher =
-        case can_watch_interrupt() of
-            true ->
+    case {can_watch_interrupt(), get(gleshell_stdin_mux)} of
+        {true, Mux} when is_pid(Mux) ->
+            %% Raw REPL: retarget the mux (no competing get_chars process).
+            set_stdin_target({interrupt, Parent}),
+            try
+                Fun()
+            after
+                set_stdin_target(line),
+                drain_interrupt_msgs()
+            end;
+        {true, _} ->
+            GL = group_leader(),
+            Watcher =
                 spawn(fun() ->
                     group_leader(GL, self()),
                     interrupt_watch_loop(Parent)
-                end);
-            false ->
-                undefined
-        end,
-    try
-        Fun()
-    after
-        case Watcher of
-            undefined ->
-                ok;
-            W ->
-                exit(W, kill),
+                end),
+            try
+                Fun()
+            after
+                stop_io_client(Watcher),
                 drain_interrupt_msgs()
-        end
+            end;
+        {false, _} ->
+            Fun()
     end.
 
 %% Collect port output without Ctrl+C watching (stty and other helpers).
@@ -3087,7 +3395,15 @@ child_env_capture_pty() ->
     disable_nested_pagers(force_color_env(child_env_base())).
 
 child_env_base() ->
-    Env0 = [{"SHELL", "/bin/sh"}],
+    {Rows, Cols} = host_term_dims(),
+    %% SHELL=/bin/sh: script(1) invokes $SHELL -c; nu/fish break that.
+    %% COLUMNS/LINES: tools that skip TIOCGWINSZ (or see a 0×0 PTY before
+    %% our runner stty) still format to the host width.
+    Env0 = [
+        {"SHELL", "/bin/sh"},
+        {"COLUMNS", integer_to_list(Cols)},
+        {"LINES", integer_to_list(Rows)}
+    ],
     case os:getenv("LESS") of
         false ->
             [{"LESS", "FRX"} | Env0];

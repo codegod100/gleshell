@@ -182,6 +182,12 @@ printed without an interactive session. Interactive keys include live `/` search
 (case-insensitive, finds as you type) and `n`/`N` next/previous match. `^less`
 still runs the external binary.
 
+External tools that would spawn system `less` (`systemctl`, `git log`, `man`, …)
+are captured with nested pagers forced to `cat`, then shown through the **same
+builtin pager** when the text does not fit on one screen. Full-screen programs
+that need a real TTY (`vim`, `htop`, `sudo`, `ssh`, …) still inherit the
+terminal. Use `^less` / a path for the external pager binary.
+
 Unknown command names fall through to external executables on `PATH`.
 
 ## Layout
@@ -205,8 +211,9 @@ src/
 
 Input and output are colorized on a TTY (Nu-like shapes on the command line;
 headers bold green, numbers purple, bools cyan, dirs blue, errors red, …).
-External tools (`jj`, `git`, `fastfetch`, …) keep their own colors: final-stage
-commands inherit the real TTY; captured pipeline stages (e.g. `jj log | less`,
+External tools (`jj`, `git`, `fastfetch`, …) keep their own colors via a
+throwaway PTY when captured (and live TTY for true interactive programs).
+Captured pipeline stages (e.g. `jj log | less`,
 `git log | less`) run under a throwaway PTY when the shell wants color so tools
 that only colorize on a terminal still emit ANSI — without per-tool env hacks.
 Nested pagers are forced to `cat` so the producer cannot hang in its own

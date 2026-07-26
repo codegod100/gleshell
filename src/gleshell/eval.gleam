@@ -59,13 +59,16 @@ fn eval_statement(env: Env, stmt: Statement) -> EvalResult {
               }
           }
       }
-    // Bare expression: last external may take the real TTY (less, vim, …).
+    // Bare expression: last stage may take a live TTY only if it needs one
+    // (vim, sudo, …). Pager-using tools (systemctl, git, man) are captured
+    // and shown via gleshell's builtin pager instead of system less.
     parser.Expr(pipeline) -> eval_pipeline(env, pipeline, Nothing, True)
   }
 }
 
-/// `allow_tty` — when True, the last pipeline stage may run as a foreground
-/// interactive process on the real terminal (needed for `less`, `vim`, etc.).
+/// `allow_tty` — when True, the last pipeline stage *may* run on a live TTY
+/// if `wants_tty` says it needs one (editors, TUIs, auth). Otherwise output
+/// is captured (nested pagers → cat) for gleshell's pager.
 fn eval_pipeline(
   env: Env,
   pipeline: Pipeline,
@@ -246,7 +249,11 @@ fn run_external(
 ) -> EvalResult {
   // Pipeline input becomes the external's stdin (Unix-style `cmd | less`).
   let stdin = stdin_bytes(input)
-  let result = case interactive {
+  // Prefer capture so tools that would spawn system `less` (systemctl, git,
+  // man, …) dump full output with nested pagers disabled. The REPL then pages
+  // through gleshell's builtin pager. Only true TUI/TTY programs inherit a
+  // live terminal (vim, htop, sudo, ssh, …).
+  let result = case interactive && wants_tty(name) {
     True -> sys.run_cmd_tty(name, str_args, stdin)
     False -> sys.run_cmd(name, str_args, stdin)
   }
@@ -273,5 +280,49 @@ fn stdin_bytes(input: Value) -> String {
     Nothing -> ""
     String(s) -> s
     other -> value.as_string(other)
+  }
+}
+
+/// True when the external must own a live TTY (full-screen UI, password
+/// prompts, REPLs). Everything else is captured so systemctl/git/man use
+/// gleshell's pager instead of spawning system `less`.
+fn wants_tty(name: String) -> Bool {
+  let base = command_basename(name)
+  case base {
+    // Editors
+    "vi" | "vim" | "nvim" | "nano" | "emacs" | "emacsclient" | "helix" | "hx"
+    | "kak" | "micro" | "ed" | "joe" -> True
+    // Explicit system pagers (builtin `less` is separate; `^less` hits this)
+    "less" | "more" | "most" -> True
+    // Process / system monitors
+    "top" | "htop" | "btop" | "glances" | "iotop" | "nethogs" | "nvtop"
+    | "gtop" | "watch" -> True
+    // File managers / TUIs
+    "ranger" | "mc" | "nnn" | "lf" | "yazi" | "xplr" | "tig" | "gitui"
+    | "lazygit" | "k9s" -> True
+    // Interactive filters
+    "fzf" | "peco" | "sk" -> True
+    // Shells / REPLs
+    "sh" | "bash" | "zsh" | "fish" | "nu" | "python" | "python3" | "ipython"
+    | "node" | "irb" | "pry" | "lua" | "psql" | "mysql" | "redis-cli"
+    | "sqlite3" | "iex" | "erl" -> True
+    // Remote / auth (need a controlling TTY)
+    "ssh" | "sftp" | "scp" | "mosh" | "telnet" | "sudo" | "doas" | "run0"
+    | "pkexec" | "su" | "login" | "passwd" | "ssh-add" -> True
+    // Multiplexers / debuggers / network TUI
+    "tmux" | "screen" | "zellij" | "gdb" | "lldb" | "cgdb" | "nmtui"
+    | "alsamixer" | "pulsemixer" | "bluetoothctl" -> True
+    _ -> False
+  }
+}
+
+fn command_basename(name: String) -> String {
+  case string.split(name, "/") {
+    [] -> name
+    parts ->
+      case list.last(parts) {
+        Ok(b) -> b
+        Error(Nil) -> name
+      }
   }
 }

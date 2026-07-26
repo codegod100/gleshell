@@ -8,6 +8,7 @@ import gleshell/color
 import gleshell/display
 import gleshell/env
 import gleshell/eval
+import gleshell/pager
 import gleshell/sys
 import gleshell/value.{Nothing}
 import simplifile
@@ -54,7 +55,8 @@ fn run_once(code: String) -> Nil {
   case eval.eval_source(env, code) {
     eval.Quit(code) -> halt(code)
     eval.Continue(_env, value) -> {
-      print_value(value)
+      // One-shots never enter the interactive pager (scripts, pipes).
+      print_value(value, False)
       case value {
         value.Fail(_) -> halt(1)
         _ -> Nil
@@ -99,7 +101,7 @@ fn repl_loop(env: env.Env) -> Nil {
               }
             }
             eval.Continue(env2, value) -> {
-              print_value(value)
+              print_value(value, True)
               repl_loop(env2)
             }
           }
@@ -256,20 +258,29 @@ fn first_line(s: String) -> String {
   }
 }
 
-fn print_value(value: value.Value) -> Nil {
+/// Print a pipeline result. When `allow_page` is True (interactive REPL) and
+/// the text does not fit on one screen, use the builtin pager instead of
+/// dumping. One-shot `-c` always dumps so scripts do not hang in a TUI.
+fn print_value(value: value.Value, allow_page: Bool) -> Nil {
   case value {
     Nothing -> Nil
     _ ->
       // External commands that used PTY relay already streamed output to the
-      // terminal (needed for run0/sudo password prompts). Skip re-printing
-      // when that flag is still set (final pipeline stage was that external).
+      // terminal (vim, sudo, …). Skip re-printing when that flag is still set.
+      // Everything else (including systemctl/git/man with nested pagers forced
+      // to cat) is captured and shown here — through the builtin pager when
+      // allowed and the text does not fit on one screen (less -F style).
       case sys.take_output_shown() {
         True -> Nil
         False -> {
           let text = display.render(value)
           case text {
             "" -> Nil
-            t -> sys.println(t)
+            t ->
+              case allow_page && pager.needs_paging(t) {
+                True -> pager.run(t)
+                False -> sys.println(t)
+              }
           }
         }
       }
