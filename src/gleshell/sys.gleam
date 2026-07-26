@@ -102,6 +102,11 @@ pub fn re_contains(
 @external(erlang, "gleshell_ffi", "complete_word")
 pub fn complete_word(prefix: String, word: String) -> #(List(String), String)
 
+/// Greyed-out history autosuggestion suffix for `buffer`, given `history`
+/// newest-first. Empty string when there is no proper prefix match.
+@external(erlang, "gleshell_ffi", "history_hint")
+pub fn history_hint(history: List(String), buffer: String) -> String
+
 @external(erlang, "gleshell_ffi", "home_dir")
 pub fn home_dir() -> Result(String, String)
 

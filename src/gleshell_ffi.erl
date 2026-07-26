@@ -25,6 +25,7 @@
     take_output_shown/0,
     clear_output_shown/0,
     complete_word/2,
+    history_hint/2,
     re_contains/3
 ]).
 
@@ -174,6 +175,10 @@ key_to_name(ctrl_w) ->
     <<"ctrl_w">>;
 key_to_name(ctrl_r) ->
     <<"ctrl_r">>;
+key_to_name(ctrl_f) ->
+    <<"ctrl_f">>;
+key_to_name(alt_f) ->
+    <<"alt_f">>;
 key_to_name(ctrl_g) ->
     <<"ctrl_g">>;
 key_to_name({char, 32}) ->
@@ -503,7 +508,8 @@ raw_loop(Prompt, Left, Right, History, HistPos, Saved) ->
         right ->
             case Right of
                 [] ->
-                    raw_loop(Prompt, Left, Right, History, HistPos, Saved);
+                    %% At end of line: accept greyed-out history hint (Nu/fish).
+                    accept_history_hint(Prompt, Left, Right, History, HistPos, Saved);
                 [C | Rest] ->
                     redraw(Prompt, [C | Left], Rest),
                     raw_loop(Prompt, [C | Left], Rest, History, HistPos, Saved)
@@ -513,9 +519,15 @@ raw_loop(Prompt, Left, Right, History, HistPos, Saved) ->
             redraw(Prompt, [], NewRight),
             raw_loop(Prompt, [], NewRight, History, HistPos, Saved);
         'end' ->
-            NewLeft = lists:reverse(Right) ++ Left,
-            redraw(Prompt, NewLeft, []),
-            raw_loop(Prompt, NewLeft, [], History, HistPos, Saved);
+            case Right of
+                [] ->
+                    %% Already at end: accept full history hint if present.
+                    accept_history_hint(Prompt, Left, Right, History, HistPos, Saved);
+                _ ->
+                    NewLeft = lists:reverse(Right) ++ Left,
+                    redraw(Prompt, NewLeft, []),
+                    raw_loop(Prompt, NewLeft, [], History, HistPos, Saved)
+            end;
         up ->
             hist_nav(Prompt, Left, Right, History, HistPos, Saved, 1);
         down ->
@@ -525,9 +537,26 @@ raw_loop(Prompt, Left, Right, History, HistPos, Saved) ->
             redraw(Prompt, [], NewRight),
             raw_loop(Prompt, [], NewRight, History, HistPos, Saved);
         ctrl_e ->
-            NewLeft = lists:reverse(Right) ++ Left,
-            redraw(Prompt, NewLeft, []),
-            raw_loop(Prompt, NewLeft, [], History, HistPos, Saved);
+            case Right of
+                [] ->
+                    accept_history_hint(Prompt, Left, Right, History, HistPos, Saved);
+                _ ->
+                    NewLeft = lists:reverse(Right) ++ Left,
+                    redraw(Prompt, NewLeft, []),
+                    raw_loop(Prompt, NewLeft, [], History, HistPos, Saved)
+            end;
+        ctrl_f ->
+            %% Emacs-style forward-char; at EOL accepts history hint (like Nu).
+            case Right of
+                [] ->
+                    accept_history_hint(Prompt, Left, Right, History, HistPos, Saved);
+                [C | Rest] ->
+                    redraw(Prompt, [C | Left], Rest),
+                    raw_loop(Prompt, [C | Left], Rest, History, HistPos, Saved)
+            end;
+        alt_f ->
+            %% Accept one word of the history hint (Nu Alt+F).
+            accept_history_hint_word(Prompt, Left, Right, History, HistPos, Saved);
         ctrl_u ->
             redraw(Prompt, [], Right),
             raw_loop(Prompt, [], Right, History, 0, <<>>);
@@ -1093,20 +1122,149 @@ redraw(Prompt, Left, Right) ->
             _ -> <<>>
         end,
     Colored = highlight_line(FullBin),
+    %% Fish/Nu-style ghost text: grey suffix of the newest history match.
+    %% Only when the cursor is at end of the buffer (Right == []).
+    HintChars =
+        case Right of
+            [] -> history_hint_suffix(Full);
+            _ -> []
+        end,
+    HintPainted = paint_history_hint(HintChars),
+    HintBin =
+        case unicode:characters_to_binary(HintChars) of
+            HB when is_binary(HB) -> HB;
+            _ -> <<>>
+        end,
     %% Clear every physical row the previous render occupied. A longer history
     %% entry can soft-wrap; `\e[2K` alone only erases the current row, so a
     %% shorter recall (or empty draft) used to leave a blank-looking row and
     %% stale wrap residue that felt like an empty ↑ slot.
     clear_input_rows(),
-    io:put_chars([Prompt, Colored]),
-    Rows = count_input_rows(Prompt, FullBin),
+    io:put_chars([Prompt, Colored, HintPainted]),
+    %% Include hint width so multi-line wrap clears correctly on next redraw.
+    Rows = count_input_rows(Prompt, <<FullBin/binary, HintBin/binary>>),
     put(gleshell_input_rows, Rows),
-    case length(Right) of
+    %% Cursor sits after typed text, before the grey hint (and before Right).
+    CursorBack = length(HintChars) + length(Right),
+    case CursorBack of
         0 ->
             ok;
         N ->
             %% Best-effort: codepoint count ≈ columns for ASCII-heavy input.
             io:put_chars(["\e[", integer_to_list(N), $D])
+    end.
+
+%% Accept the full greyed-out history suggestion into the buffer.
+accept_history_hint(Prompt, Left, Right, History, HistPos, Saved) ->
+    case Right of
+        [] ->
+            case history_hint_suffix(lists:reverse(Left)) of
+                [] ->
+                    raw_loop(Prompt, Left, Right, History, HistPos, Saved);
+                Suffix ->
+                    %% Left is reversed; append Suffix at end of buffer.
+                    NewLeft = lists:reverse(Suffix) ++ Left,
+                    redraw(Prompt, NewLeft, []),
+                    raw_loop(Prompt, NewLeft, [], History, 0, <<>>)
+            end;
+        _ ->
+            raw_loop(Prompt, Left, Right, History, HistPos, Saved)
+    end.
+
+%% Accept the next word of the history suggestion (leading space + word).
+accept_history_hint_word(Prompt, Left, Right, History, HistPos, Saved) ->
+    case Right of
+        [] ->
+            case history_hint_suffix(lists:reverse(Left)) of
+                [] ->
+                    raw_loop(Prompt, Left, Right, History, HistPos, Saved);
+                Suffix ->
+                    Word = take_hint_word(Suffix),
+                    case Word of
+                        [] ->
+                            raw_loop(Prompt, Left, Right, History, HistPos, Saved);
+                        _ ->
+                            NewLeft = lists:reverse(Word) ++ Left,
+                            redraw(Prompt, NewLeft, []),
+                            raw_loop(Prompt, NewLeft, [], History, 0, <<>>)
+                    end
+            end;
+        _ ->
+            raw_loop(Prompt, Left, Right, History, HistPos, Saved)
+    end.
+
+%% First token of a hint: optional leading whitespace + following non-space run.
+take_hint_word([]) ->
+    [];
+take_hint_word([C | Rest]) when C =:= $\s; C =:= $\t ->
+    [C | take_hint_nonspace(Rest)];
+take_hint_word(Rest) ->
+    take_hint_nonspace(Rest).
+
+take_hint_nonspace([]) ->
+    [];
+take_hint_nonspace([C | _Rest]) when C =:= $\s; C =:= $\t ->
+    [];
+take_hint_nonspace([C | Rest]) ->
+    [C | take_hint_nonspace(Rest)].
+
+%% Newest-first history: suffix of the first entry that has Buffer as a proper prefix.
+history_hint_suffix([]) ->
+    [];
+history_hint_suffix(Buffer) when is_list(Buffer) ->
+    Hist =
+        case get(gleshell_history) of
+            L when is_list(L) -> L;
+            _ -> []
+        end,
+    history_hint_suffix(Hist, Buffer).
+
+history_hint_suffix([], _Buffer) ->
+    [];
+%% Empty buffer: never ghost the whole previous command (Nu default).
+history_hint_suffix(_History, []) ->
+    [];
+history_hint_suffix([H | T], Buffer) ->
+    HList =
+        case H of
+            Bin when is_binary(Bin) -> unicode:characters_to_list(Bin);
+            List when is_list(List) -> List;
+            _ -> []
+        end,
+    case is_list(HList) andalso lists:prefix(Buffer, HList) of
+        true when length(HList) > length(Buffer) ->
+            lists:nthtail(length(Buffer), HList);
+        _ ->
+            history_hint_suffix(T, Buffer)
+    end.
+
+paint_history_hint([]) ->
+    [];
+paint_history_hint(Chars) ->
+    case get(gleshell_color) of
+        false ->
+            Chars;
+        _ ->
+            %% Dark gray — same as Nu `color_config.hints` / shape_nothing.
+            ["\e[90m", Chars, "\e[0m"]
+    end.
+
+%% Test helper: given history (newest first) and buffer, return grey suffix binary.
+-spec history_hint(list(binary()), binary()) -> binary().
+history_hint(History, Buffer) when is_list(History), is_binary(Buffer) ->
+    BufList =
+        case unicode:characters_to_list(Buffer) of
+            L when is_list(L) -> L;
+            _ -> []
+        end,
+    case history_hint_suffix(History, BufList) of
+        [] ->
+            <<>>;
+        Suffix ->
+            case unicode:characters_to_binary(Suffix) of
+                Bin when is_binary(Bin) -> Bin;
+                _ -> <<>>
+            end
     end.
 
 %% Move to the start of the previous input block and erase its rows.
@@ -1232,6 +1390,7 @@ decode_key(21, _) -> ctrl_u;
 decode_key(23, _) -> ctrl_w;
 decode_key(12, _) -> ctrl_l;
 decode_key(18, _) -> ctrl_r;
+decode_key(6, _) -> ctrl_f;
 decode_key(?ESC, _) ->
     read_escape();
 decode_key(C, _) when is_integer(C), C >= 32 ->
@@ -1256,6 +1415,11 @@ read_escape() ->
                 <<"F">> -> 'end';
                 _ -> other
             end;
+        %% Alt+letter arrives as ESC then the letter (meta).
+        <<$f>> ->
+            alt_f;
+        <<$F>> ->
+            alt_f;
         _ ->
             other
     end.

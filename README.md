@@ -68,13 +68,19 @@ green, numbers purple, pipes purple, flags blue, variables purple, …).
 |-----|--------|
 | ↑ / ↓ | History |
 | **Tab** | Command completion (builtins + `PATH`) at the start of a pipeline stage; filename completion for arguments (common prefix; list matches if ambiguous) |
+| **→ / Ctrl+F / End / Ctrl+E** (at end of line) | Accept greyed-out history suggestion (full) |
+| **Alt+F** (at end of line) | Accept one word of the history suggestion |
 | **Ctrl+R** | Reverse-i-search through history (Enter accepts onto the line) |
-| Ctrl+A / Ctrl+E | Beginning / end of line |
+| Ctrl+A / Ctrl+E | Beginning / end of line (Ctrl+E at end also accepts a history hint) |
 | Ctrl+W | Delete previous word |
 | Ctrl+U / Ctrl+K | Kill to start / end of line |
 | Ctrl+L | Clear screen |
 | **Ctrl+C** | Cancel current line at the prompt; while an external command runs, send SIGINT to that process (does not exit the shell) |
 | Ctrl+D | EOF (empty line) or delete under cursor |
+
+As you type, the **newest matching history line** is shown in grey after the
+cursor (Nushell/fish-style hints). Accept with **→**, **End**, **Ctrl+E**, or
+**Ctrl+F**; accept one word with **Alt+F**.
 
 History is persisted under the user cache as `gleshell-history/lines`.
 Non-TTY input falls back to Erlang’s `edlin`/`get_until` path.

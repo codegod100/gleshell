@@ -1193,6 +1193,28 @@ pub fn complete_path_executable_test() {
   Nil
 }
 
+// --- history ghost-text hints (Nu/fish style) ---
+
+pub fn history_hint_newest_prefix_test() {
+  // Newest-first: first entry that has the buffer as a proper prefix wins.
+  let hist = ["ls | where type == file", "ls | first 3", "echo hi"]
+  let assert " | where type == file" = sys.history_hint(hist, "ls")
+  let assert " | first 3" = sys.history_hint(["ls | first 3", "ls | where x"], "ls")
+  let assert " type == file" = sys.history_hint(hist, "ls | where")
+  let assert " hi" = sys.history_hint(hist, "echo")
+  Nil
+}
+
+pub fn history_hint_no_match_test() {
+  let hist = ["ls", "echo hi"]
+  let assert "" = sys.history_hint(hist, "cd")
+  // Exact match only — no suffix
+  let assert "" = sys.history_hint(hist, "ls")
+  // Empty buffer never suggests
+  let assert "" = sys.history_hint(hist, "")
+  Nil
+}
+
 fn list_contains(items: List(String), needle: String) -> Bool {
   case items {
     [] -> False
