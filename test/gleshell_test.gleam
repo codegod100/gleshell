@@ -450,6 +450,43 @@ pub fn http_subcommand_errors_test() {
   Nil
 }
 
+pub fn eval_ps_test() {
+  let env = env.new()
+  // Default columns match Nushell short `ps`.
+  let assert eval.Continue(_, Table(cols, rows)) = eval.eval_source(env, "ps")
+  let assert [
+    "pid",
+    "ppid",
+    "name",
+    "status",
+    "cpu",
+    "mem",
+    "virtual",
+  ] = cols
+  let assert True = rows != []
+
+  // pid 1 exists on Linux
+  let assert eval.Continue(_, Table(_, pid1_rows)) =
+    eval.eval_source(env, "ps | where pid == 1")
+  let assert True = pid1_rows != []
+
+  // --long adds the extra Nu columns
+  let assert eval.Continue(_, Table(long_cols, _)) =
+    eval.eval_source(env, "ps --long")
+  let assert True = list.contains(long_cols, "command")
+  let assert True = list.contains(long_cols, "start_time")
+  let assert True = list.contains(long_cols, "cwd")
+  let assert True = list.length(long_cols) > list.length(cols)
+
+  // which / help
+  let assert eval.Continue(_, String("builtin: ps")) =
+    eval.eval_source(env, "which ps")
+  let assert eval.Continue(_, String(help_out)) =
+    eval.eval_source(env, "help ps")
+  let assert True = string.contains(help_out, "--long")
+  Nil
+}
+
 pub fn http_get_live_test() {
   // Live request against postman-echo (JSON). Skip gracefully if offline.
   let env = env.new()

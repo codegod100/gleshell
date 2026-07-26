@@ -29,7 +29,8 @@
     history_hint/2,
     history_search/2,
     re_contains/3,
-    format_unix_local/1
+    format_unix_local/1,
+    list_processes/0
 ]).
 
 -define(ESC, 16#1b).
@@ -745,8 +746,8 @@ fallback_builtin_names() ->
         "about", "append", "cat", "cd", "columns", "count", "describe", "echo",
         "env", "exit", "filter", "find", "first", "flatten", "from", "get",
         "help", "identity", "ignore", "is-empty", "is_empty", "keys", "last",
-        "length", "less", "lines", "ls", "open", "prepend", "print", "pwd",
-        "quit", "range", "reverse", "save", "select", "skip", "sort-by",
+        "length", "less", "lines", "ls", "open", "prepend", "print", "ps",
+        "pwd", "quit", "range", "reverse", "save", "select", "skip", "sort-by",
         "sort_by", "sys", "table", "take", "to", "type", "typeof", "uniq",
         "unwrap", "values", "where", "which", "wrap"
     ].
@@ -3231,3 +3232,382 @@ month_abbr(10) -> "Oct";
 month_abbr(11) -> "Nov";
 month_abbr(12) -> "Dec";
 month_abbr(_) -> "???".
+
+%% ---------------------------------------------------------------------------
+%% ps: list system processes (Nushell-compatible columns, Linux /proc)
+%% ---------------------------------------------------------------------------
+%%
+%% Returns a list of 17-tuples, one per process (numeric /proc entries that
+%% can still be read after a short CPU sample interval):
+%%
+%%   {Pid, Ppid, Name, Status, Cpu, Mem, Virtual, Command, StartTime,
+%%    UserId, ProcessGroupId, SessionId, Priority, ProcessThreads,
+%%    Working, Paged, Cwd}
+%%
+%% Integers are bytes for mem/virtual/working/paged; StartTime is Unix
+%% seconds (0 if unknown). Cpu is percent of one core over ~100ms, like Nu.
+%%
+-spec list_processes() ->
+    list({
+        integer(),
+        integer(),
+        binary(),
+        binary(),
+        float(),
+        integer(),
+        integer(),
+        binary(),
+        integer(),
+        integer(),
+        integer(),
+        integer(),
+        integer(),
+        integer(),
+        integer(),
+        integer(),
+        binary()
+    }).
+list_processes() ->
+    case os:type() of
+        {unix, linux} ->
+            list_processes_linux();
+        _ ->
+            %% Other OSes: empty table rather than crash; caller still gets
+            %% a valid table shape from the Gleam side when needed.
+            []
+    end.
+
+list_processes_linux() ->
+    Ticks = clk_tck(),
+    PageSize = page_size(),
+    Boot = boot_time_seconds(),
+    Base = snapshot_cpu_times(),
+    timer:sleep(100),
+    IntervalMs = 100.0,
+    case file:list_dir("/proc") of
+        {ok, Entries} ->
+            lists:filtermap(
+                fun(Entry) ->
+                    case is_pid_name(Entry) of
+                        false ->
+                            false;
+                        true ->
+                            Pid = list_to_integer(Entry),
+                            case read_process(Pid, Ticks, PageSize, Boot, Base, IntervalMs) of
+                                {ok, Row} ->
+                                    {true, Row};
+                                error ->
+                                    false
+                            end
+                    end
+                end,
+                Entries
+            );
+        {error, _} ->
+            []
+    end.
+
+is_pid_name([]) ->
+    false;
+is_pid_name(Name) ->
+    lists:all(fun(C) -> C >= $0 andalso C =< $9 end, Name).
+
+%% Map pid -> total jiffies (utime+stime) from first snapshot.
+snapshot_cpu_times() ->
+    case file:list_dir("/proc") of
+        {ok, Entries} ->
+            lists:foldl(
+                fun(Entry, Acc) ->
+                    case is_pid_name(Entry) of
+                        false ->
+                            Acc;
+                        true ->
+                            Pid = list_to_integer(Entry),
+                            case read_stat_cpu(Pid) of
+                                {ok, Total} ->
+                                    Acc#{Pid => Total};
+                                error ->
+                                    Acc
+                            end
+                    end
+                end,
+                #{},
+                Entries
+            );
+        {error, _} ->
+            #{}
+    end.
+
+read_stat_cpu(Pid) ->
+    case read_stat_fields(Pid) of
+        {ok, Fields} ->
+            U = maps:get(utime, Fields, 0),
+            S = maps:get(stime, Fields, 0),
+            {ok, U + S};
+        error ->
+            error
+    end.
+
+read_process(Pid, Ticks, PageSize, Boot, Base, IntervalMs) ->
+    case read_stat_fields(Pid) of
+        {ok, Fields} ->
+            U = maps:get(utime, Fields, 0),
+            S = maps:get(stime, Fields, 0),
+            Total = U + S,
+            Prev = maps:get(Pid, Base, Total),
+            Delta = max(0, Total - Prev),
+            %% usage_ms = delta_jiffies * 1000 / ticks; percent of one core
+            UsageMs =
+                case Ticks > 0 of
+                    true ->
+                        Delta * 1000 / Ticks;
+                    false ->
+                        0.0
+                end,
+            Cpu =
+                case IntervalMs > 0.0 of
+                    true ->
+                        UsageMs * 100.0 / IntervalMs;
+                    false ->
+                        0.0
+                end,
+            Status = status_name(maps:get(state, Fields, $?)),
+            Name = maps:get(comm, Fields, <<>>),
+            Ppid = maps:get(ppid, Fields, 0),
+            Pgrp = maps:get(pgrp, Fields, 0),
+            Session = maps:get(session, Fields, 0),
+            Priority = maps:get(priority, Fields, 0),
+            Threads = maps:get(num_threads, Fields, 0),
+            Vsize = maps:get(vsize, Fields, 0),
+            RssPages = maps:get(rss, Fields, 0),
+            MemFromStat = RssPages * PageSize,
+            StartJiffies = maps:get(starttime, Fields, 0),
+            StartTime =
+                case Boot > 0 andalso Ticks > 0 of
+                    true ->
+                        Boot + StartJiffies div Ticks;
+                    false ->
+                        0
+                end,
+            {Mem, Working, Paged, Virtual, UserId} = read_status_mem(Pid, MemFromStat, Vsize),
+            Command = read_cmdline(Pid, Name),
+            Cwd = read_cwd(Pid),
+            %% Gleam `ProcessInfo` constructor → Erlang `{process_info, ...}`.
+            {ok,
+                {process_info, Pid, Ppid, Name, Status, float(Cpu), Mem, Virtual,
+                    Command, StartTime, UserId, Pgrp, Session, Priority, Threads,
+                    Working, Paged, Cwd}};
+        error ->
+            error
+    end.
+
+%% Parse /proc/<pid>/stat. Comm is between the first '(' and the matching ") ".
+read_stat_fields(Pid) ->
+    Path = "/proc/" ++ integer_to_list(Pid) ++ "/stat",
+    case file:read_file(Path) of
+        {ok, Bin0} ->
+            Bin = string:trim(Bin0, trailing, [$\n]),
+            case binary:split(Bin, <<"(">>) of
+                [_PidBin, Rest] ->
+                    case binary:match(Rest, <<") ">>) of
+                        {Pos, 2} ->
+                            Comm = binary:part(Rest, 0, Pos),
+                            After = binary:part(Rest, Pos + 2, byte_size(Rest) - Pos - 2),
+                            Fs = binary:split(After, <<" ">>, [global]),
+                            %% Indices after state (0-based): see proc(5)
+                            %% 0 state, 1 ppid, 2 pgrp, 3 session,
+                            %% 11 utime, 12 stime, 15 priority, 17 num_threads,
+                            %% 19 starttime, 20 vsize, 21 rss
+                            try
+                                StateBin = nth_bin(Fs, 1),
+                                State =
+                                    case StateBin of
+                                        <<C, _/binary>> ->
+                                            C;
+                                        <<>> ->
+                                            $?;
+                                        _ ->
+                                            $?
+                                    end,
+                                {ok, #{
+                                    comm => Comm,
+                                    state => State,
+                                    ppid => nth_int(Fs, 2),
+                                    pgrp => nth_int(Fs, 3),
+                                    session => nth_int(Fs, 4),
+                                    utime => nth_int(Fs, 12),
+                                    stime => nth_int(Fs, 13),
+                                    priority => nth_int(Fs, 16),
+                                    num_threads => nth_int(Fs, 18),
+                                    starttime => nth_int(Fs, 20),
+                                    vsize => nth_int(Fs, 21),
+                                    rss => nth_int(Fs, 22)
+                                }}
+                            catch
+                                _:_ ->
+                                    error
+                            end;
+                        nomatch ->
+                            error
+                    end;
+                _ ->
+                    error
+            end;
+        {error, _} ->
+            error
+    end.
+
+nth_bin(List, N) when N >= 1 ->
+    case length(List) >= N of
+        true ->
+            lists:nth(N, List);
+        false ->
+            <<>>
+    end.
+
+nth_int(List, N) ->
+    case nth_bin(List, N) of
+        <<>> ->
+            0;
+        Bin ->
+            try
+                binary_to_integer(Bin)
+            catch
+                _:_ ->
+                    0
+            end
+    end.
+
+status_name($S) -> <<"Sleeping">>;
+status_name($R) -> <<"Running">>;
+status_name($D) -> <<"Disk sleep">>;
+status_name($Z) -> <<"Zombie">>;
+status_name($T) -> <<"Stopped">>;
+status_name($t) -> <<"Tracing">>;
+status_name($X) -> <<"Dead">>;
+status_name($x) -> <<"Dead">>;
+status_name($K) -> <<"Wakekill">>;
+status_name($W) -> <<"Waking">>;
+status_name($P) -> <<"Parked">>;
+status_name($I) -> <<"Idle">>;
+status_name(_) -> <<"Unknown">>.
+
+%% Prefer VmRSS / VmSize / VmSwap (kB) and Uid from status; fall back to stat.
+read_status_mem(Pid, MemFromStat, VsizeFromStat) ->
+    Path = "/proc/" ++ integer_to_list(Pid) ++ "/status",
+    case file:read_file(Path) of
+        {ok, Bin} ->
+            Lines = binary:split(Bin, <<"\n">>, [global]),
+            Mem = kb_field(Lines, <<"VmRSS:">>, MemFromStat),
+            Virtual = kb_field(Lines, <<"VmSize:">>, VsizeFromStat),
+            Paged = kb_field(Lines, <<"VmSwap:">>, 0),
+            UserId = uid_field(Lines),
+            {Mem, Mem, Paged, Virtual, UserId};
+        {error, _} ->
+            {MemFromStat, MemFromStat, 0, VsizeFromStat, 0}
+    end.
+
+kb_field(Lines, Key, Default) ->
+    case find_status_line(Lines, Key) of
+        {ok, Rest} ->
+            %% "   1234 kB"
+            case re:run(Rest, <<"([0-9]+)">>, [{capture, all_but_first, binary}]) of
+                {match, [Num]} ->
+                    binary_to_integer(Num) * 1024;
+                _ ->
+                    Default
+            end;
+        error ->
+            Default
+    end.
+
+uid_field(Lines) ->
+    case find_status_line(Lines, <<"Uid:">>) of
+        {ok, Rest} ->
+            case re:run(Rest, <<"([0-9]+)">>, [{capture, all_but_first, binary}]) of
+                {match, [Num]} ->
+                    binary_to_integer(Num);
+                _ ->
+                    0
+            end;
+        error ->
+            0
+    end.
+
+find_status_line([], _Key) ->
+    error;
+find_status_line([Line | Rest], Key) ->
+    Klen = byte_size(Key),
+    case Line of
+        <<Key:Klen/binary, RestLine/binary>> ->
+            {ok, RestLine};
+        _ ->
+            find_status_line(Rest, Key)
+    end.
+
+read_cmdline(Pid, FallbackName) ->
+    Path = "/proc/" ++ integer_to_list(Pid) ++ "/cmdline",
+    case file:read_file(Path) of
+        {ok, <<>>} ->
+            FallbackName;
+        {ok, Bin} ->
+            Parts = [P || P <- binary:split(Bin, <<0>>, [global]), P =/= <<>>],
+            case Parts of
+                [] ->
+                    FallbackName;
+                _ ->
+                    Joined = iolist_to_binary(lists:join(<<" ">>, Parts)),
+                    %% Nu collapses newlines/tabs in the display command.
+                    re:replace(Joined, <<"[\n\t]">>, <<" ">>, [global, {return, binary}])
+            end;
+        {error, _} ->
+            FallbackName
+    end.
+
+read_cwd(Pid) ->
+    Path = "/proc/" ++ integer_to_list(Pid) ++ "/cwd",
+    case file:read_link(Path) of
+        {ok, Target} ->
+            unicode:characters_to_binary(Target);
+        {error, _} ->
+            <<>>
+    end.
+
+clk_tck() ->
+    case getconf_int("CLK_TCK") of
+        {ok, N} when N > 0 ->
+            N;
+        _ ->
+            100
+    end.
+
+page_size() ->
+    case getconf_int("PAGE_SIZE") of
+        {ok, N} when N > 0 ->
+            N;
+        _ ->
+            4096
+    end.
+
+getconf_int(Name) ->
+    Cmd = "getconf " ++ Name,
+    try
+        Out = string:trim(os:cmd(Cmd)),
+        {ok, list_to_integer(Out)}
+    catch
+        _:_ ->
+            error
+    end.
+
+boot_time_seconds() ->
+    case file:read_file("/proc/stat") of
+        {ok, Bin} ->
+            case re:run(Bin, <<"btime ([0-9]+)">>, [{capture, all_but_first, binary}]) of
+                {match, [Num]} ->
+                    binary_to_integer(Num);
+                _ ->
+                    0
+            end;
+        {error, _} ->
+            0
+    end.

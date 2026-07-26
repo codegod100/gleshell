@@ -118,6 +118,11 @@ echo $env.MY_VAR
 which ls
 which -a ls
 which -f sh
+
+# processes (Nushell-style table)
+ps
+ps | sort-by mem | last 5
+ps --long | where name == beam.smp
 ```
 
 ## Language sketch

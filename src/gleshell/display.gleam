@@ -261,7 +261,12 @@ fn list_index_of_loop(
 fn cell_plain(col: String, value: Value) -> String {
   case col, value {
     "size", Int(n) -> format_filesize(n)
+    "mem", Int(n) -> format_filesize(n)
+    "virtual", Int(n) -> format_filesize(n)
+    "working", Int(n) -> format_filesize(n)
+    "paged", Int(n) -> format_filesize(n)
     "modified", Int(n) -> format_datetime(n)
+    "start_time", Int(n) -> format_datetime(n)
     _, _ -> value.cell_string(value)
   }
 }
@@ -322,8 +327,9 @@ fn color_cell_for_column(
   case col {
     "name" -> color_path_name(on, plain, type_hint)
     "type" -> color_entry_type(on, plain)
-    "size" -> color.filesize(on, plain)
-    "modified" -> color.datetime(on, plain)
+    "size" | "mem" | "virtual" | "working" | "paged" ->
+      color.filesize(on, plain)
+    "modified" | "start_time" -> color.datetime(on, plain)
     _ -> color_by_value(on, value, plain)
   }
 }

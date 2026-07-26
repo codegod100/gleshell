@@ -88,6 +88,7 @@ pub fn registry() -> dict.Dict(String, Builtin) {
     #("values", cmd_values),
     #("keys", cmd_keys),
     #("sys", cmd_sys),
+    #("ps", cmd_ps),
     #("about", cmd_about),
     #("less", cmd_less),
   ])
@@ -275,6 +276,28 @@ fn help_for(name: String) -> Result(String, Nil) {
         ],
         "\n",
       ))
+    "ps" ->
+      Ok(string.join(
+        [
+          "ps [-l|--long] — view system processes as a table",
+          "",
+          "Inspired by Nushell `ps`. Default columns: pid, ppid, name, status,",
+          "cpu, mem, virtual. With --long, also: command, start_time, user_id,",
+          "process_group_id, session_id, priority, process_threads, working,",
+          "paged, cwd.",
+          "",
+          "Flags:",
+          "  -l, --long   include all available columns",
+          "",
+          "Examples:",
+          "  ps",
+          "  ps | sort-by mem | last 5",
+          "  ps | sort-by cpu | last 3",
+          "  ps --long | where name == beam.smp",
+          "  ps | where pid == 1 | get name",
+        ],
+        "\n",
+      ))
     _ -> help_line(name)
   }
 }
@@ -364,6 +387,10 @@ fn help_text() -> dict.Dict(String, String) {
     #("values", "values — list of values from a record"),
     #("keys", "keys — list of keys from a record"),
     #("sys", "sys — host info record (cwd, home, shell, last_exit)"),
+    #(
+      "ps",
+      "ps [-l|--long] — system processes table (pid, name, cpu, mem, …)",
+    ),
     #("about", "about — authorship, ATProto handle, and a little sparkle"),
     #(
       "less",
@@ -2326,6 +2353,50 @@ fn cmd_sys(
       #("last_exit", Int(env.last_exit)),
     ]),
   )
+}
+
+// --- ps (Nushell-style process table) ---
+
+fn cmd_ps(
+  env: Env,
+  _input: Value,
+  _args: List(Value),
+  flags: dict.Dict(String, Value),
+) -> BuiltinResult {
+  let #(long, _) = find_bool_flag(flags, ["l", "long"])
+  let records =
+    list.map(sys.list_processes(), fn(p) { process_to_record(p, long) })
+  ok(env, value.table_from_records(records))
+}
+
+fn process_to_record(p: sys.ProcessInfo, long: Bool) -> Value {
+  let base = [
+    #("pid", Int(p.pid)),
+    #("ppid", Int(p.ppid)),
+    #("name", String(p.name)),
+    #("status", String(p.status)),
+    #("cpu", Float(p.cpu)),
+    #("mem", Int(p.mem)),
+    #("virtual", Int(p.virtual)),
+  ]
+  case long {
+    False -> Record(base)
+    True ->
+      Record(
+        list.append(base, [
+          #("command", String(p.command)),
+          #("start_time", Int(p.start_time)),
+          #("user_id", Int(p.user_id)),
+          #("process_group_id", Int(p.process_group_id)),
+          #("session_id", Int(p.session_id)),
+          #("priority", Int(p.priority)),
+          #("process_threads", Int(p.process_threads)),
+          #("working", Int(p.working)),
+          #("paged", Int(p.paged)),
+          #("cwd", String(p.cwd)),
+        ]),
+      )
+  }
 }
 
 // --- less (color-aware pager) ---

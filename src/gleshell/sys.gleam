@@ -128,3 +128,32 @@ pub fn stdout_isatty() -> Bool
 /// Format Unix epoch seconds as local `Jul 3 2026 9:39:40 PM` (12-hour).
 @external(erlang, "gleshell_ffi", "format_unix_local")
 pub fn format_unix_local(seconds: Int) -> String
+
+/// One process row from `list_processes` (Nushell `ps` columns).
+/// Memory fields are bytes; `start_time` is Unix epoch seconds (0 if unknown).
+pub type ProcessInfo {
+  ProcessInfo(
+    pid: Int,
+    ppid: Int,
+    name: String,
+    status: String,
+    cpu: Float,
+    mem: Int,
+    virtual: Int,
+    command: String,
+    start_time: Int,
+    user_id: Int,
+    process_group_id: Int,
+    session_id: Int,
+    priority: Int,
+    process_threads: Int,
+    working: Int,
+    paged: Int,
+    cwd: String,
+  )
+}
+
+/// System processes (Linux `/proc`; empty list on unsupported OS).
+/// Samples CPU over ~100ms like Nushell `ps`.
+@external(erlang, "gleshell_ffi", "list_processes")
+pub fn list_processes() -> List(ProcessInfo)
