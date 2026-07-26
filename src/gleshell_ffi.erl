@@ -2724,6 +2724,10 @@ stty_sane() ->
     %%   left on, Ctrl+C sits in the line buffer until Enter and our key
     %%   relay never sees it (external freezes; second ^C looks wedged)
     %% - -echo: host must not echo keys we relay into the child PTY
+    %% - -icrnl: keep Enter as CR (0x0D). `sane` enables ICRNL, which turns
+    %%   Enter into NL (0x0A). Relayed into a raw-mode child (hx/vim/…),
+    %%   crossterm treats 0x0A as Ctrl+J → Char('j'), so `:wq` + Enter
+    %%   inserts `j` instead of submitting the command.
     _ = stty_run([
         "sane",
         "-isig",
@@ -2732,7 +2736,8 @@ stty_sane() ->
         "1",
         "time",
         "0",
-        "-echo"
+        "-echo",
+        "-icrnl"
     ]),
     ok.
 
