@@ -140,7 +140,9 @@ Data: `echo`, `range`, `lines`, `to`/`from` (subcommand `json`), `type`, `descri
 
 Pager: `less` — builtin color-aware pager for pipeline input or files (`ls | less`,
 `less README.md`). ANSI from tables and external tools is kept; short output is
-printed without an interactive session. `^less` still runs the external binary.
+printed without an interactive session. Interactive keys include live `/` search
+(case-insensitive, finds as you type) and `n`/`N` next/previous match. `^less`
+still runs the external binary.
 
 Unknown command names fall through to external executables on `PATH`.
 
@@ -165,13 +167,14 @@ src/
 Input and output are colorized on a TTY (Nu-like shapes on the command line;
 headers bold green, numbers purple, bools cyan, dirs blue, errors red, …).
 External tools (`jj`, `git`, `fastfetch`, …) keep their own colors: final-stage
-commands inherit the real TTY; captured pipeline stages get `FORCE_COLOR` /
-`CLICOLOR_FORCE`, and git gets `color.ui=always` plus `log.decorate=short` via
-`GIT_CONFIG_*` (git ignores `FORCE_COLOR`, and `decorate=auto` drops
-`(HEAD, origin/main, …)` when stdout is a pipe — so bare `git log | less`
-would otherwise lose both color and ref decorations). Pre-colored text is not
-re-painted by the shell. While the raw line editor is active, the TTY is
-switched to cooked mode for those children so LF-only output does not
+commands inherit the real TTY; captured pipeline stages (e.g. `jj log | less`,
+`git log | less`) run under a throwaway PTY when the shell wants color so tools
+that only colorize on a terminal still emit ANSI — without per-tool env hacks.
+Nested pagers are forced to `cat` so the producer cannot hang in its own
+`less`. If `script` is unavailable, capture falls back to pipes plus
+`FORCE_COLOR` / `CLICOLOR_FORCE` and a git `GIT_CONFIG_*` overlay. Pre-colored
+text is not re-painted by the shell. While the raw line editor is active, the
+TTY is switched to cooked mode for those children so LF-only output does not
 staircase. The builtin `less` keeps ANSI (like `less -R`); external pagers
 still get `LESS=FRX` when unset so they pass colors through.
 Disable with `NO_COLOR=1`; force with `FORCE_COLOR=1`.

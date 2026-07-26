@@ -1,4 +1,5 @@
 import gleam/list
+import gleam/option.{None, Some}
 import gleam/string
 import gleeunit
 import gleshell/builtins
@@ -577,6 +578,120 @@ pub fn pager_display_lines_splits_newlines_test() {
   Nil
 }
 
+pub fn strip_ansi_removes_csi_test() {
+  let painted = color.paint(True, "\u{001b}[32m", "hello")
+  let assert "hello" = color.strip_ansi(painted)
+  let assert "plain" = color.strip_ansi("plain")
+  let assert "ab" = color.strip_ansi("a\u{001b}[1;31mb\u{001b}[0m")
+  Nil
+}
+
+pub fn pager_line_matches_strips_ansi_test() {
+  let painted = color.paint(True, "\u{001b}[31m", "needle")
+  let assert True = pager.line_matches(painted, "needle")
+  let assert True = pager.line_matches(painted, "eed")
+  // Case-insensitive: mixed / upper pattern still hits.
+  let assert True = pager.line_matches(painted, "NEEDLE")
+  let assert True = pager.line_matches(painted, "NeEd")
+  let assert False = pager.line_matches(painted, "")
+  // Pattern must not match inside CSI itself.
+  let assert False = pager.line_matches(painted, "[31m")
+  Nil
+}
+
+pub fn pager_find_after_and_before_test() {
+  let lines = ["alpha", "bravo", "alpha", "charlie"]
+  let assert Ok(#(0, False)) = pager.find_after(lines, "alpha", -1)
+  let assert Ok(#(2, False)) = pager.find_after(lines, "alpha", 0)
+  // Wrap from end back to first match.
+  let assert Ok(#(0, True)) = pager.find_after(lines, "alpha", 2)
+  let assert Error(Nil) = pager.find_after(lines, "zzz", -1)
+  // Case-insensitive search.
+  let assert Ok(#(0, False)) = pager.find_after(lines, "ALPHA", -1)
+  let assert Ok(#(2, False)) = pager.find_after(lines, "AlPhA", 0)
+
+  let assert Ok(#(2, False)) = pager.find_before(lines, "alpha", 3)
+  let assert Ok(#(0, False)) = pager.find_before(lines, "alpha", 2)
+  // Wrap from start back to last match.
+  let assert Ok(#(2, True)) = pager.find_before(lines, "alpha", 0)
+  let assert Ok(#(2, False)) = pager.find_before(lines, "ALPHA", 3)
+  Nil
+}
+
+pub fn pager_find_empty_pattern_test() {
+  let lines = ["a", "b"]
+  let assert Error(Nil) = pager.find_after(lines, "", -1)
+  let assert Error(Nil) = pager.find_before(lines, "", 2)
+  Nil
+}
+
+pub fn pager_live_search_preview_test() {
+  let lines = ["alpha", "bravo", "charlie", "alpha again"]
+  // Empty query: stay put, no highlight.
+  let assert #(2, None, None) = pager.live_search_preview(lines, "", 2)
+  // Inclusive of start_offset (match on current top line).
+  let assert #(0, Some("alpha"), None) =
+    pager.live_search_preview(lines, "alpha", 0)
+  // From mid-buffer: first match at or after start.
+  let assert #(3, Some("alpha"), None) =
+    pager.live_search_preview(lines, "alpha", 1)
+  // Not found: keep start offset, still paint pattern, status suffix.
+  let assert #(1, Some("zzz"), Some("not found")) =
+    pager.live_search_preview(lines, "zzz", 1)
+  // Progressive typing narrows: "ch" → charlie.
+  let assert #(2, Some("ch"), None) = pager.live_search_preview(lines, "ch", 0)
+  // Case-insensitive: upper pattern still finds lower content.
+  let assert #(0, Some("ALPHA"), None) =
+    pager.live_search_preview(lines, "ALPHA", 0)
+  let assert #(3, Some("Alpha"), None) =
+    pager.live_search_preview(lines, "Alpha", 1)
+  Nil
+}
+
+pub fn pager_highlight_matches_test() {
+  let out = pager.highlight_matches("hello world", "world")
+  // Black on bright yellow accent.
+  let assert True = string.contains(out, "\u{001b}[30;103m")
+  let assert True = string.contains(out, "world")
+  let assert True = string.contains(out, "\u{001b}[39;49m")
+  let assert "hello world" = color.strip_ansi(out)
+
+  // Case-insensitive highlight preserves original casing in the line.
+  let ci = pager.highlight_matches("Hello World", "WORLD")
+  let assert True = string.contains(ci, "\u{001b}[30;103m")
+  let assert True = string.contains(ci, "World")
+  let assert "Hello World" = color.strip_ansi(ci)
+
+  // No match / empty pattern: unchanged.
+  let assert "nope" = pager.highlight_matches("nope", "zzz")
+  let assert "x" = pager.highlight_matches("x", "")
+
+  // Multiple non-overlapping hits.
+  let multi = pager.highlight_matches("aa x aa", "aa")
+  let parts = string.split(multi, "\u{001b}[30;103m")
+  let assert 3 = list.length(parts)
+
+  // ANSI around the match is preserved; highlight still finds visible text.
+  let painted = color.paint(True, "\u{001b}[32m", "needle here")
+  let hi = pager.highlight_matches(painted, "needle")
+  let assert True = string.contains(hi, "\u{001b}[32m")
+  let assert True = string.contains(hi, "\u{001b}[30;103m")
+  let assert "needle here" = color.strip_ansi(hi)
+  let assert True = string.contains(hi, "\u{001b}[39;49m")
+  Nil
+}
+
+pub fn pager_highlight_match_spanning_sgr_test() {
+  // Match crosses a mid-string color change: black-on-yellow re-opens after SGR.
+  let line = "ab\u{001b}[31mcd\u{001b}[0mef"
+  let hi = pager.highlight_matches(line, "bcde")
+  let assert True = string.contains(hi, "\u{001b}[30;103m")
+  let assert "abcdef" = color.strip_ansi(hi)
+  // After the red open, accent should be re-applied inside the match.
+  let assert True = string.contains(hi, "\u{001b}[31m\u{001b}[30;103m")
+  Nil
+}
+
 pub fn less_short_output_passthrough_test() {
   // Non-TTY test runner: needs_paging is false → less returns the text.
   let env = env.new()
@@ -616,36 +731,15 @@ pub fn less_help_test() {
     eval.eval_source(env, "help less")
   let assert True = string.contains(help_out, "ANSI")
   let assert True = string.contains(help_out, "q")
-  Nil
-}
-
-pub fn pipeline_capture_forces_git_tty_config_test() {
-  // git ignores FORCE_COLOR and hides decorations on pipes; child_env injects
-  // color.ui=always + log.decorate=short. FORCE_COLOR makes want_child_color
-  // true without a TTY. Use `let` so capture mode does not leak printenv.
-  let prev = sys.getenv("FORCE_COLOR")
-  let assert Ok(_) = sys.setenv("FORCE_COLOR", "1")
-  let env = env.new()
-  let color = eval.eval_source(env, "let x = ^printenv GIT_CONFIG_VALUE_0")
-  let decorate = eval.eval_source(env, "let y = ^printenv GIT_CONFIG_VALUE_1")
-  case prev {
-    Ok(v) -> {
-      let assert Ok(_) = sys.setenv("FORCE_COLOR", v)
-      Nil
-    }
-    Error(Nil) -> {
-      let assert Ok(_) = sys.setenv("FORCE_COLOR", "")
-      Nil
-    }
-  }
-  let assert eval.Continue(_, String(color_out)) = color
-  let assert eval.Continue(_, String(decorate_out)) = decorate
-  let assert True = string.contains(color_out, "always")
-  let assert True = string.contains(decorate_out, "short")
+  let assert True = string.contains(help_out, "/pattern")
+  let assert True = string.contains(help_out, "n / N")
   Nil
 }
 
 pub fn git_log_pipeline_emits_ansi_and_decorate_test() {
+  // Capture uses a throwaway PTY when color is wanted, so git colorizes and
+  // keeps ref decorations without GIT_CONFIG_* hacks. FORCE_COLOR makes
+  // want_child_color true in non-TTY test runners.
   let prev = sys.getenv("FORCE_COLOR")
   let assert Ok(_) = sys.setenv("FORCE_COLOR", "1")
   let env = env.new()
@@ -664,8 +758,29 @@ pub fn git_log_pipeline_emits_ansi_and_decorate_test() {
   let assert eval.Continue(_, String(out)) = result
   // Real git colors, not gleshell string-green on plain text.
   let assert True = string.contains(out, "\u{001b}[")
-  // decorate=short: ref names like HEAD / main (auto would omit on a pipe).
+  // TTY-style decorate: ref names like HEAD / main.
   let assert True = string.contains(out, "HEAD") || string.contains(out, "main")
+  Nil
+}
+
+pub fn jj_log_pipeline_emits_ansi_test() {
+  // jj ignores FORCE_COLOR; PTY capture is what keeps colors for `jj log | less`.
+  let prev = sys.getenv("FORCE_COLOR")
+  let assert Ok(_) = sys.setenv("FORCE_COLOR", "1")
+  let env = env.new()
+  let result = eval.eval_source(env, "jj log -n 1 | identity")
+  case prev {
+    Ok(v) -> {
+      let assert Ok(_) = sys.setenv("FORCE_COLOR", v)
+      Nil
+    }
+    Error(Nil) -> {
+      let assert Ok(_) = sys.setenv("FORCE_COLOR", "")
+      Nil
+    }
+  }
+  let assert eval.Continue(_, String(out)) = result
+  let assert True = string.contains(out, "\u{001b}[")
   Nil
 }
 

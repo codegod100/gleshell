@@ -1431,7 +1431,8 @@ stdout_isatty() ->
 %% Two modes:
 %%
 %% 1. `run_cmd/2` — capture stdout/stderr into a binary (pipelines, `let x =`,
-%%    non-TTY). Uses pipes; the child does NOT get a real terminal.
+%%    non-TTY display). Prefers a throwaway PTY when color is wanted so tools
+%%    emit ANSI for `cmd | less`; falls back to pipes.
 %%
 %% 2. `run_cmd_tty/2` — foreground interactive. Prefer util-linux `script`
 %%    (PTY + key relay via `io:get_chars`) so Ctrl+C can SIGINT the child.
@@ -1634,15 +1635,70 @@ resolve_cmd(Command, Args) ->
             {ok, Path, PortArgs}
     end.
 
-%% Capture mode: pipes, no TTY. `child_env` forces color when the shell wants
-%% it so tools like `jj` still embed ANSI we can pass through on display.
+%% Capture mode: collect stdout/stderr into a binary (pipelines, `let x =`).
 %%
-%% Stdin is always redirected via `sh -c` + `$GLESHELL_STDIN` (either a temp
-%% file with pipeline bytes, or `/dev/null`) so programs never hang on an
-%% open-but-never-written Erlang port pipe.
+%% When the shell wants color, prefer a throwaway PTY (`script`) so tools that
+%% only colorize on a TTY (`jj`, `git`, …) still emit ANSI for `cmd | less` —
+%% without tool-specific env hacks. Nested pagers are forced to `cat` so the
+%% child cannot hang waiting for interactive `less`. Falls back to plain pipes
+%% (+ FORCE_COLOR / git overlays) when `script` is missing.
+%%
+%% Stdin is redirected via temp file / `$GLESHELL_STDIN` so programs never hang
+%% on an open-but-never-written Erlang port pipe.
 run_cmd_capture(Path, PortArgs, Stdin) when is_binary(Stdin) ->
+    case want_child_color() of
+        true ->
+            case os:find_executable("script") of
+                Script when is_list(Script) ->
+                    run_cmd_capture_pty(Script, Path, PortArgs, Stdin);
+                _ ->
+                    run_cmd_capture_pipe(Path, PortArgs, Stdin)
+            end;
+        false ->
+            run_cmd_capture_pipe(Path, PortArgs, Stdin)
+    end.
+
+run_cmd_capture_pipe(Path, PortArgs, Stdin) when is_binary(Stdin) ->
     with_stdin_file(Stdin, fun(StdinPath) ->
         sh_exec(Path, PortArgs, StdinPath, capture)
+    end).
+
+%% PTY capture: child sees a TTY (colors, auto decorations) but we only collect
+%% output — nothing is relayed to the user's terminal.
+run_cmd_capture_pty(Script, Path, PortArgs, <<>>) ->
+    run_cmd_capture_pty_argv(Script, [Path | PortArgs]);
+run_cmd_capture_pty(Script, Path, PortArgs, Stdin) when is_binary(Stdin) ->
+    with_stdin_file(Stdin, fun(StdinPath) ->
+        with_exec_runner(Path, PortArgs, StdinPath, fun(Runner) ->
+            run_cmd_capture_pty_argv(Script, [Runner])
+        end)
+    end).
+
+run_cmd_capture_pty_argv(Script, Argv) when is_list(Argv) ->
+    with_trapped_exits(fun() ->
+        Port = open_port(
+            {spawn_executable, Script},
+            [
+                binary,
+                exit_status,
+                stderr_to_stdout,
+                use_stdio,
+                stream,
+                {env, child_env_capture_pty()},
+                {args, ["-q", "-e", "/dev/null", "--" | Argv]}
+            ]
+        ),
+        put(gleshell_output_shown, false),
+        try
+            case collect_output(Port, <<>>) of
+                {ok, {Status, Acc}} ->
+                    {ok, {Status, normalize_pty_output(Acc)}};
+                Other ->
+                    Other
+            end
+        after
+            catch port_close(Port)
+        end
     end).
 
 %% Inherit real stdio — pagers/editors talk to the terminal directly.
@@ -2237,30 +2293,35 @@ normalize_pty_output(Bin) when is_binary(Bin) ->
 %% Extra env for external commands (merged into the process environment).
 %%
 %% - SHELL=/bin/sh: `script` invokes $SHELL; nu/fish break `script -c`.
-%% - LESS=FRX when unset: pagers (jj/git → less) pass through ANSI colors (-R)
-%%   and exit on short output (-F) without clearing the screen (-X).
-%% - When the shell wants color and the child has no TTY (pipeline capture):
-%%   FORCE_COLOR / CLICOLOR_FORCE for tools that honor them (jj, many CLIs),
-%%   and git GIT_CONFIG_* overlays (git ignores FORCE_COLOR and treats pipes as
-%%   non-terminals): color.ui=always so `git log | less` is colored, and
-%%   log.decorate=short because decorate=auto drops ref names
-%%   (`(HEAD, origin/main, …)`) when stdout is not a TTY.
+%% - LESS=FRX when unset: external pagers pass through ANSI (-R) and exit on
+%%   short output (-F) without clearing the screen (-X).
+%% - When the shell wants color and the child has no real TTY (pipe capture
+%%   fallback): FORCE_COLOR / CLICOLOR_FORCE, plus git GIT_CONFIG_* overlays
+%%   (git ignores FORCE_COLOR; decorate=auto drops ref names on pipes).
+%%   Prefer PTY capture (`child_env_capture_pty`) so jj/git/etc. colorize
+%%   naturally for `cmd | less` without per-tool config.
 child_env() ->
-    Env0 = [{"SHELL", "/bin/sh"}],
-    Env1 =
-        case os:getenv("LESS") of
-            false ->
-                [{"LESS", "FRX"} | Env0];
-            "" ->
-                [{"LESS", "FRX"} | Env0];
-            _ ->
-                Env0
-        end,
+    Env0 = child_env_base(),
     case want_child_color() of
         false ->
-            Env1;
+            Env0;
         true ->
-            force_git_tty_env(force_color_env(Env1))
+            force_git_tty_env(force_color_env(Env0))
+    end.
+
+%% PTY capture env: color via TTY detection; never nest an interactive pager.
+child_env_capture_pty() ->
+    disable_nested_pagers(force_color_env(child_env_base())).
+
+child_env_base() ->
+    Env0 = [{"SHELL", "/bin/sh"}],
+    case os:getenv("LESS") of
+        false ->
+            [{"LESS", "FRX"} | Env0];
+        "" ->
+            [{"LESS", "FRX"} | Env0];
+        _ ->
+            Env0
     end.
 
 %% FORCE_COLOR / CLICOLOR_FORCE for children that honor them.
@@ -2283,8 +2344,20 @@ force_color_env(Env) ->
             Env1
     end.
 
-%% Make git behave like a TTY for captured pipelines (git ≥ 2.31 GIT_CONFIG_*).
-%% Skipped when the caller already set GIT_CONFIG_COUNT so we do not clobber.
+%% Capture must not hang inside the child's own pager (git/jj → less).
+%% Always override for PTY capture; interactive `run_cmd_tty` uses child_env/0.
+disable_nested_pagers(Env) ->
+    [
+        {"PAGER", "cat"},
+        {"GIT_PAGER", "cat"},
+        {"JJ_PAGER", "cat"},
+        {"SYSTEMD_PAGER", "cat"},
+        {"MANPAGER", "cat"}
+        | Env
+    ].
+
+%% Pipe-capture fallback only (git ≥ 2.31 GIT_CONFIG_*). Skipped when the
+%% caller already set GIT_CONFIG_COUNT so we do not clobber.
 %%
 %% - color.ui=always: git ignores FORCE_COLOR
 %% - log.decorate=short: default auto hides decorations on non-TTY stdout

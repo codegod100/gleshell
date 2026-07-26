@@ -1,5 +1,6 @@
 //// Nushell-inspired ANSI colors for structured values.
 
+import gleam/list
 import gleam/string
 import gleshell/sys
 
@@ -277,6 +278,12 @@ pub fn visible_length(s: String) -> Int {
   visible_length_loop(string.to_utf_codepoints(s), 0, AnsiNormal)
 }
 
+/// Drop ANSI/VT escape sequences, leaving only visible text.
+/// Used by the pager search so color codes do not break matches.
+pub fn strip_ansi(s: String) -> String {
+  strip_ansi_loop(string.to_utf_codepoints(s), [], AnsiNormal)
+}
+
 type AnsiScan {
   AnsiNormal
   /// Saw ESC; next byte chooses the sequence kind.
@@ -310,6 +317,36 @@ fn visible_length_loop(
       case n >= 0x40 && n <= 0x7E {
         True -> visible_length_loop(rest, acc, AnsiNormal)
         False -> visible_length_loop(rest, acc, AnsiCsi)
+      }
+    }
+  }
+}
+
+fn strip_ansi_loop(
+  codes: List(UtfCodepoint),
+  acc: List(UtfCodepoint),
+  state: AnsiScan,
+) -> String {
+  case codes, state {
+    [], _ ->
+      case string.from_utf_codepoints(list.reverse(acc)) {
+        s -> s
+      }
+    [c, ..rest], AnsiNormal ->
+      case string.utf_codepoint_to_int(c) == 0x1B {
+        True -> strip_ansi_loop(rest, acc, AnsiEsc)
+        False -> strip_ansi_loop(rest, [c, ..acc], AnsiNormal)
+      }
+    [c, ..rest], AnsiEsc ->
+      case string.utf_codepoint_to_int(c) {
+        0x5B -> strip_ansi_loop(rest, acc, AnsiCsi)
+        _ -> strip_ansi_loop(rest, acc, AnsiNormal)
+      }
+    [c, ..rest], AnsiCsi -> {
+      let n = string.utf_codepoint_to_int(c)
+      case n >= 0x40 && n <= 0x7E {
+        True -> strip_ansi_loop(rest, acc, AnsiNormal)
+        False -> strip_ansi_loop(rest, acc, AnsiCsi)
       }
     }
   }

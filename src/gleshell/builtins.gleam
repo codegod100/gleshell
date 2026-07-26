@@ -232,6 +232,7 @@ fn help_for(name: String) -> Result(String, Nil) {
           "  j / ↓ / Enter     line down     k / ↑        line up",
           "  space / f / PgDn  page down     b / PgUp     page up",
           "  g / Home          top           G / End      bottom",
+          "  /pattern          live search   n / N        next/prev",
           "  h / ?             help          q / Ctrl+C   quit",
           "",
           "Examples:",
