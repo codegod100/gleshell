@@ -33,8 +33,26 @@ pub fn render_with(on: Bool, value: Value) -> String {
       }
     }
     Record(fields) -> render_record(on, fields)
+    // Bare epoch seconds (e.g. `now`, `ls | get modified` on one row): print
+    // like the `modified` column — local 12-hour datetime, not a raw integer.
+    Int(n) -> render_bare_int(on, n)
     other -> color_cell(on, "", other, value.cell_string(other))
   }
+}
+
+/// Root-level ints that look like Unix timestamps display as local datetimes
+/// (same form as `ls` modified). Small ints and non-epoch values stay numeric.
+fn render_bare_int(on: Bool, n: Int) -> String {
+  case is_epoch_seconds(n) {
+    True -> color.datetime(on, format_datetime(n))
+    False -> color.int_(on, int.to_string(n))
+  }
+}
+
+/// Plausible wall-clock epoch seconds (2001-09-09 .. 2100-01-01).
+/// Used only for bare-value display so `now` and extracted mtimes read as times.
+fn is_epoch_seconds(n: Int) -> Bool {
+  n >= 1_000_000_000 && n < 4_102_444_800
 }
 
 /// External programs often embed their own colors. Pass those through.

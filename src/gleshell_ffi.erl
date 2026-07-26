@@ -3,6 +3,7 @@
 -include_lib("kernel/include/file.hrl").
 -export([
     get_line/1,
+    read_user_input/1,
     parse_line/2,
     run_as_shell/1,
     spawn_shell/2,
@@ -30,7 +31,9 @@
     history_search/2,
     re_contains/3,
     format_unix_local/1,
-    list_processes/0
+    unix_now/0,
+    list_processes/0,
+    list_port_sockets/1
 ]).
 
 -define(ESC, 16#1b).
@@ -257,6 +260,143 @@ parse_line(_Cont, eof) ->
     {done, eof, []};
 parse_line(_Cont, Chars) when is_list(Chars) ->
     {done, Chars, []}.
+
+%% ---------------------------------------------------------------------------
+%% Public: multi-line user input for the `input` builtin
+%%
+%% Interactive (raw REPL or TTY): read until Ctrl+D / EOF so the user can
+%% paste a blob and end with Ctrl+D, e.g. `input | from json`.
+%% Non-TTY (piped stdin): read the whole stream — `printf '…' | gle -c 'input | …'`.
+%% Optional prompt is printed first (empty prompt = silent).
+%% ---------------------------------------------------------------------------
+
+-spec read_user_input(binary()) -> {ok, binary()} | {error, binary()}.
+read_user_input(Prompt) when is_binary(Prompt) ->
+    case Prompt of
+        <<>> ->
+            ok;
+        _ ->
+            %% Prompt on its own line so paste starts cleanly below it.
+            case get(gleshell_raw) of
+                true ->
+                    io:put_chars(to_crlf(<<Prompt/binary, "\n">>));
+                _ ->
+                    io:put_chars(<<Prompt/binary, "\n">>)
+            end
+    end,
+    try
+        case get(gleshell_raw) of
+            true ->
+                read_input_raw([]);
+            _ ->
+                case stdin_isatty() of
+                    true ->
+                        read_input_lines([]);
+                    false ->
+                        read_input_stream([])
+                end
+        end
+    catch
+        _:Reason ->
+            {error, reason_to_bin(Reason)}
+    end.
+
+%% Raw-mode multi-line: echo printable chars, Enter → newline, Ctrl+D ends.
+read_input_raw(Acc) ->
+    case read_key() of
+        eof ->
+            io:put_chars("\r\n"),
+            {ok, codepoints_to_bin(lists:reverse(Acc))};
+        ctrl_d ->
+            io:put_chars("\r\n"),
+            {ok, codepoints_to_bin(lists:reverse(Acc))};
+        ctrl_c ->
+            io:put_chars("^C\r\n"),
+            {error, <<"interrupted">>};
+        enter ->
+            io:put_chars("\r\n"),
+            read_input_raw([$\n | Acc]);
+        backspace ->
+            case Acc of
+                [] ->
+                    read_input_raw(Acc);
+                [$\n | _] ->
+                    %% Do not erase previous lines with a simple \b.
+                    read_input_raw(Acc);
+                [_ | Rest] ->
+                    io:put_chars("\b \b"),
+                    read_input_raw(Rest)
+            end;
+        {char, C} when is_integer(C), C >= 32 ->
+            io:put_chars(unicode:characters_to_binary([C])),
+            read_input_raw([C | Acc]);
+        {error, _} ->
+            io:put_chars("\r\n"),
+            {error, <<"io_error">>};
+        _Other ->
+            read_input_raw(Acc)
+    end.
+
+codepoints_to_bin(Cs) ->
+    unicode:characters_to_binary(Cs).
+
+%% Cooked/edlin TTY: line-at-a-time until EOF (Ctrl+D on empty line).
+read_input_lines(Acc) ->
+    case io:get_line("") of
+        eof ->
+            {ok, iolist_to_binary(lists:reverse(Acc))};
+        {error, interrupted} ->
+            {error, <<"interrupted">>};
+        {error, _} ->
+            {error, <<"io_error">>};
+        Line when is_list(Line); is_binary(Line) ->
+            Bin = unicode:characters_to_binary(Line),
+            read_input_lines([Bin | Acc]);
+        Other ->
+            try
+                Bin = unicode:characters_to_binary(Other),
+                read_input_lines([Bin | Acc])
+            catch
+                _:_ ->
+                    {error, <<"io_error">>}
+            end
+    end.
+
+%% Piped / non-TTY stdin: drain the whole stream.
+read_input_stream(Acc) ->
+    case io:get_chars("", 8192) of
+        eof ->
+            {ok, iolist_to_binary(lists:reverse(Acc))};
+        {error, Reason} ->
+            {error, reason_to_bin(Reason)};
+        Data when is_binary(Data) ->
+            read_input_stream([Data | Acc]);
+        Data when is_list(Data) ->
+            read_input_stream([unicode:characters_to_binary(Data) | Acc]);
+        Other ->
+            try
+                Bin = unicode:characters_to_binary(Other),
+                read_input_stream([Bin | Acc])
+            catch
+                _:_ ->
+                    {error, <<"io_error">>}
+            end
+    end.
+
+-spec stdin_isatty() -> boolean().
+stdin_isatty() ->
+    try
+        case prim_tty:isatty(stdin) of
+            true ->
+                true;
+            _ ->
+                false
+        end
+    catch
+        _:_ ->
+            %% Fallback: if we cannot tell, prefer stream read so pipes work.
+            false
+    end.
 
 %% ---------------------------------------------------------------------------
 %% Shell bootstrap: prefer OTP raw mode for live syntax highlighting.
@@ -745,11 +885,12 @@ fallback_builtin_names() ->
     [
         "about", "append", "cat", "cd", "columns", "count", "describe", "echo",
         "env", "exit", "filter", "find", "first", "flatten", "from", "get",
-        "help", "identity", "ignore", "is-empty", "is_empty", "keys", "last",
-        "length", "less", "lines", "ls", "open", "prepend", "print", "ps",
-        "pwd", "quit", "range", "reverse", "save", "select", "skip", "sort-by",
-        "sort_by", "sys", "table", "take", "to", "type", "typeof", "uniq",
-        "unwrap", "values", "where", "which", "wrap"
+        "help", "identity", "ignore", "input", "is-empty", "is_empty", "keys",
+        "last", "length", "less", "lines", "ls", "now", "open", "prepend",
+        "print", "ps", "pwd", "quit", "range", "reverse", "save", "select",
+        "skip", "sort-by", "sort_by", "sys", "table", "take", "to", "type",
+        "typeof", "uniq", "unwrap", "values", "where", "which", "whyport",
+        "wrap"
     ].
 
 %% Executable basenames on PATH that match Prefix (deduped, sorted).
@@ -3189,6 +3330,14 @@ reason_to_bin(Reason) ->
     iolist_to_binary(io_lib:format("~p", [Reason])).
 
 %% ---------------------------------------------------------------------------
+%% Current Unix epoch seconds (UTC). Used by the `now` builtin.
+%% ---------------------------------------------------------------------------
+
+-spec unix_now() -> integer().
+unix_now() ->
+    os:system_time(second).
+
+%% ---------------------------------------------------------------------------
 %% Format Unix epoch seconds as local calendar time:
 %% "Jul 3 2026 9:39:40 PM" (abbreviated month, 12-hour clock).
 %% Used for `ls` modified column display (data stays as raw Int).
@@ -3611,3 +3760,301 @@ boot_time_seconds() ->
         {error, _} ->
             0
     end.
+
+%% ---------------------------------------------------------------------------
+%% whyport: sockets using a local/remote port (like `lsof -i :<port>`)
+%% ---------------------------------------------------------------------------
+%%
+%% Returns a list of Gleam `PortSocket` records (Erlang tagged tuples):
+%%
+%%   {port_socket, Protocol, Family, LocalAddress, LocalPort,
+%%    RemoteAddress, RemotePort, State, Pid, Name, Command, UserId, Fd}
+%%
+%% Protocol: <<"tcp">> | <<"udp">>
+%% Family:   <<"ipv4">> | <<"ipv6">>
+%% State:    LISTEN / ESTABLISHED / … (TCP) or empty for UDP
+%% Pid/Fd:   0 when the owning process is unknown (permissions / TIME_WAIT)
+%%
+%% Linux only via /proc/net/{tcp,tcp6,udp,udp6} + /proc/*/fd socket inodes.
+%%
+-spec list_port_sockets(integer()) ->
+    list({
+        port_socket,
+        binary(),
+        binary(),
+        binary(),
+        integer(),
+        binary(),
+        integer(),
+        binary(),
+        integer(),
+        binary(),
+        binary(),
+        integer(),
+        integer()
+    }).
+list_port_sockets(Port) when is_integer(Port), Port >= 0, Port =< 65535 ->
+    case os:type() of
+        {unix, linux} ->
+            list_port_sockets_linux(Port);
+        _ ->
+            []
+    end;
+list_port_sockets(_) ->
+    [].
+
+list_port_sockets_linux(Port) ->
+    SockMap = socket_inode_map(),
+    Sources = [
+        {"/proc/net/tcp", <<"tcp">>, ipv4},
+        {"/proc/net/tcp6", <<"tcp">>, ipv6},
+        {"/proc/net/udp", <<"udp">>, ipv4},
+        {"/proc/net/udp6", <<"udp">>, ipv6}
+    ],
+    lists:flatmap(
+        fun({Path, Proto, Family}) ->
+            parse_net_table(Path, Proto, Family, Port, SockMap)
+        end,
+        Sources
+    ).
+
+%% inode => list of {Pid, Fd, Name, Command}
+socket_inode_map() ->
+    case file:list_dir("/proc") of
+        {ok, Entries} ->
+            lists:foldl(
+                fun(Entry, Acc) ->
+                    case is_pid_name(Entry) of
+                        false ->
+                            Acc;
+                        true ->
+                            Pid = list_to_integer(Entry),
+                            merge_pid_sockets(Pid, Acc)
+                    end
+                end,
+                #{},
+                Entries
+            );
+        {error, _} ->
+            #{}
+    end.
+
+merge_pid_sockets(Pid, Acc) ->
+    FdDir = "/proc/" ++ integer_to_list(Pid) ++ "/fd",
+    case file:list_dir(FdDir) of
+        {ok, Fds} ->
+            {Name, Command} = pid_name_command(Pid),
+            lists:foldl(
+                fun(FdName, Acc1) ->
+                    case is_pid_name(FdName) of
+                        false ->
+                            Acc1;
+                        true ->
+                            Fd = list_to_integer(FdName),
+                            Link = FdDir ++ "/" ++ FdName,
+                            case file:read_link(Link) of
+                                {ok, Target} ->
+                                    case socket_inode_from_link(Target) of
+                                        {ok, Inode} ->
+                                            Owner = {Pid, Fd, Name, Command},
+                                            Prev = maps:get(Inode, Acc1, []),
+                                            Acc1#{Inode => [Owner | Prev]};
+                                        error ->
+                                            Acc1
+                                    end;
+                                {error, _} ->
+                                    Acc1
+                            end
+                    end
+                end,
+                Acc,
+                Fds
+            );
+        {error, _} ->
+            Acc
+    end.
+
+%% "socket:[12345]" or "socket:[12345]\n"
+socket_inode_from_link(Target) when is_list(Target) ->
+    socket_inode_from_link(unicode:characters_to_binary(Target));
+socket_inode_from_link(Target) when is_binary(Target) ->
+    case re:run(Target, <<"^socket:\\[([0-9]+)\\]">>, [{capture, all_but_first, binary}]) of
+        {match, [Num]} ->
+            {ok, binary_to_integer(Num)};
+        _ ->
+            error
+    end;
+socket_inode_from_link(_) ->
+    error.
+
+pid_name_command(Pid) ->
+    case read_stat_fields(Pid) of
+        {ok, Fields} ->
+            Name = maps:get(comm, Fields, <<>>),
+            {Name, read_cmdline(Pid, Name)};
+        error ->
+            {<<>>, <<>>}
+    end.
+
+parse_net_table(Path, Proto, Family, Port, SockMap) ->
+    case file:read_file(Path) of
+        {ok, Bin} ->
+            Lines = binary:split(Bin, <<"\n">>, [global]),
+            %% First line is the header.
+            case Lines of
+                [_Header | Rows] ->
+                    lists:flatmap(
+                        fun(Line) ->
+                            parse_net_row(Line, Proto, Family, Port, SockMap)
+                        end,
+                        Rows
+                    );
+                [] ->
+                    []
+            end;
+        {error, _} ->
+            []
+    end.
+
+parse_net_row(<<>>, _Proto, _Family, _Port, _SockMap) ->
+    [];
+parse_net_row(Line, Proto, Family, Port, SockMap) ->
+    %% /proc/net/tcp columns (whitespace-separated after optional "sl:" index):
+    %%   sl local_address rem_address st … uid timeout inode
+    Parts = [P || P <- binary:split(string:trim(Line), <<" ">>, [global]), P =/= <<>>],
+    case Parts of
+        %% drop "0:" style index
+        [_Sl, Local, Remote, St | Rest] when length(Rest) >= 6 ->
+            %% uid is 7th field after sl (index 7 in 0-based after splitting with sl),
+            %% inode is field 9 (0-based: parts after drop of sl: local=0 rem=1 st=2
+            %% tx=3 rx=4 tr=5 tm=6 retrnsmt=7 uid=8 timeout=9 inode=10 — wait.
+            %% With sl kept: [sl, local, rem, st, tx_rx, tr_tm, retrnsmt, uid, timeout, inode]
+            %% Actually tx_queue:rx_queue is one token, tr:tm->when is one.
+            %% Parts after split: sl, local, rem, st, tx:rx, tr:tm, retrnsmt, uid, timeout, inode, …
+            case Rest of
+                [_TxRx, _TrTm, _Retr, UidBin, _Timeout, InodeBin | _] ->
+                    case {parse_addr_port(Local, Family), parse_addr_port(Remote, Family)} of
+                        {{ok, LAddr, LPort}, {ok, RAddr, RPort}} ->
+                            case LPort =:= Port orelse RPort =:= Port of
+                                false ->
+                                    [];
+                                true ->
+                                    State = tcp_state_name(Proto, St),
+                                    Uid =
+                                        try
+                                            binary_to_integer(UidBin)
+                                        catch
+                                            _:_ ->
+                                                0
+                                        end,
+                                    Inode =
+                                        try
+                                            binary_to_integer(InodeBin)
+                                        catch
+                                            _:_ ->
+                                                0
+                                        end,
+                                    Owners = maps:get(Inode, SockMap, []),
+                                    case Owners of
+                                        [] ->
+                                            [
+                                                {port_socket, Proto, family_bin(Family), LAddr, LPort,
+                                                    RAddr, RPort, State, 0, <<>>, <<>>, Uid, 0}
+                                            ];
+                                        _ ->
+                                            [
+                                                {port_socket, Proto, family_bin(Family), LAddr, LPort,
+                                                    RAddr, RPort, State, Pid, Name, Command, Uid, Fd}
+                                             || {Pid, Fd, Name, Command} <- lists:reverse(Owners)
+                                            ]
+                                    end
+                            end;
+                        _ ->
+                            []
+                    end;
+                _ ->
+                    []
+            end;
+        _ ->
+            []
+    end.
+
+family_bin(ipv4) -> <<"ipv4">>;
+family_bin(ipv6) -> <<"ipv6">>.
+
+%% Local/remote address in /proc/net is HEXIP:HEXPORT (host byte order for port;
+%% IP is little-endian 32-bit words).
+parse_addr_port(Bin, Family) ->
+    case binary:split(Bin, <<":">>) of
+        [IpHex, PortHex] ->
+            try
+                Port = binary_to_integer(PortHex, 16),
+                Addr = decode_ip(IpHex, Family),
+                {ok, Addr, Port}
+            catch
+                _:_ ->
+                    error
+            end;
+        _ ->
+            error
+    end.
+
+decode_ip(Hex, ipv4) ->
+    <<A, B, C, D>> = <<(binary_to_integer(Hex, 16)):32/little>>,
+    iolist_to_binary(io_lib:format("~b.~b.~b.~b", [A, B, C, D]));
+decode_ip(Hex, ipv6) ->
+    %% 32 hex chars = 4 little-endian 32-bit words → 16 network-order bytes
+    Int = binary_to_integer(Hex, 16),
+    <<W0:32, W1:32, W2:32, W3:32>> = <<Int:128/big>>,
+    <<B0:8, B1:8, B2:8, B3:8>> = <<W0:32/little>>,
+    <<B4:8, B5:8, B6:8, B7:8>> = <<W1:32/little>>,
+    <<B8:8, B9:8, B10:8, B11:8>> = <<W2:32/little>>,
+    <<B12:8, B13:8, B14:8, B15:8>> = <<W3:32/little>>,
+    Bytes = <<B0, B1, B2, B3, B4, B5, B6, B7, B8, B9, B10, B11, B12, B13, B14, B15>>,
+    format_ipv6(Bytes).
+
+%% Compact-ish IPv6 text (not full RFC 5952, but readable).
+format_ipv6(<<0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0>>) ->
+    <<"::">>;
+format_ipv6(<<0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, A, B, C, D>>) ->
+    %% IPv4-mapped
+    iolist_to_binary(io_lib:format("::ffff:~b.~b.~b.~b", [A, B, C, D]));
+format_ipv6(<<B0, B1, B2, B3, B4, B5, B6, B7, B8, B9, B10, B11, B12, B13, B14, B15>>) ->
+    Groups = [
+        (B0 bsl 8) bor B1,
+        (B2 bsl 8) bor B3,
+        (B4 bsl 8) bor B5,
+        (B6 bsl 8) bor B7,
+        (B8 bsl 8) bor B9,
+        (B10 bsl 8) bor B11,
+        (B12 bsl 8) bor B13,
+        (B14 bsl 8) bor B15
+    ],
+    Parts = [iolist_to_binary(io_lib:format("~.16b", [G])) || G <- Groups],
+    iolist_to_binary(lists:join(<<":">>, Parts)).
+
+tcp_state_name(<<"udp">>, _) ->
+    <<"">>;
+tcp_state_name(<<"tcp">>, StHex) ->
+    try
+        case binary_to_integer(StHex, 16) of
+            1 -> <<"ESTABLISHED">>;
+            2 -> <<"SYN_SENT">>;
+            3 -> <<"SYN_RECV">>;
+            4 -> <<"FIN_WAIT1">>;
+            5 -> <<"FIN_WAIT2">>;
+            6 -> <<"TIME_WAIT">>;
+            7 -> <<"CLOSE">>;
+            8 -> <<"CLOSE_WAIT">>;
+            9 -> <<"LAST_ACK">>;
+            10 -> <<"LISTEN">>;
+            11 -> <<"CLOSING">>;
+            12 -> <<"NEW_SYN_RECV">>;
+            N -> iolist_to_binary(io_lib:format("UNKNOWN(~b)", [N]))
+        end
+    catch
+        _:_ ->
+            StHex
+    end;
+tcp_state_name(_, St) ->
+    St.

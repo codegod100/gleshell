@@ -1,3 +1,4 @@
+import gleam/int
 import gleam/list
 import gleam/option.{None, Some}
 import gleam/string
@@ -275,6 +276,27 @@ pub fn eval_env_var_get_test() {
   Nil
 }
 
+pub fn eval_get_dotted_path_test() {
+  let env = env.new()
+  // Nested record: get a.b
+  let assert eval.Continue(_, String("ada")) =
+    eval.eval_source(env, "echo {user: {name: \"ada\"}} | get user.name")
+  // Deeper path
+  let assert eval.Continue(_, Int(42)) =
+    eval.eval_source(env, "echo {a: {b: {c: 42}}} | get a.b.c")
+  // Mid-path list: collect nested field from each item
+  let assert eval.Continue(_, List([String("x"), String("y")])) =
+    eval.eval_source(
+      env,
+      "echo {items: [{n: \"x\"}, {n: \"y\"}]} | get items.n",
+    )
+  // Missing path errors on records
+  let assert eval.Continue(_, value.Fail(msg)) =
+    eval.eval_source(env, "echo {a: 1} | get a.b")
+  let assert True = string.contains(msg, "get:")
+  Nil
+}
+
 pub fn eval_env_record_test() {
   let env = env.new()
   let assert eval.Continue(_, Record(fields)) = eval.eval_source(env, "$env")
@@ -393,6 +415,65 @@ pub fn eval_from_json_test() {
   Nil
 }
 
+pub fn eval_from_jwt_test() {
+  let env = env.new()
+  // Classic jwt.io sample (HS256); parse-only — signature not verified.
+  let token =
+    "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+
+  let assert eval.Continue(_, Record(fields)) =
+    eval.eval_source(env, "echo \"" <> token <> "\" | from jwt")
+
+  // header
+  let assert Ok(Record(header_fields)) = list_find_field(fields, "header")
+  let assert True = list_has_field(header_fields, "alg", String("HS256"))
+  let assert True = list_has_field(header_fields, "typ", String("JWT"))
+
+  // payload claims
+  let assert Ok(Record(payload_fields)) = list_find_field(fields, "payload")
+  let assert True =
+    list_has_field(payload_fields, "sub", String("1234567890"))
+  let assert True =
+    list_has_field(payload_fields, "name", String("John Doe"))
+  let assert True = list_has_field(payload_fields, "iat", Int(1_516_239_022))
+
+  // signature segment preserved as base64url text
+  let assert Ok(String(sig)) = list_find_field(fields, "signature")
+  let assert "SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c" = sig
+
+  // Argument form + Bearer prefix
+  let assert eval.Continue(_, Record(_)) =
+    eval.eval_source(env, "from jwt \"Bearer " <> token <> "\"")
+
+  // Nested get (pipeline and dotted path)
+  let assert eval.Continue(_, String("HS256")) =
+    eval.eval_source(
+      env,
+      "echo \"" <> token <> "\" | from jwt | get header | get alg",
+    )
+  let assert eval.Continue(_, String("HS256")) =
+    eval.eval_source(
+      env,
+      "echo \"" <> token <> "\" | from jwt | get header.alg",
+    )
+
+  // Errors
+  let assert eval.Continue(env2, value.Fail(msg)) =
+    eval.eval_source(env, "echo not-a-jwt | from jwt")
+  let assert True =
+    string.contains(msg, "segments") || string.contains(msg, "base64")
+  let assert 1 = env2.last_exit
+
+  let assert eval.Continue(_, value.Fail(empty_msg)) =
+    eval.eval_source(env, "echo \"\" | from jwt")
+  let assert True = string.contains(empty_msg, "empty")
+
+  let assert eval.Continue(_, String(help_out)) =
+    eval.eval_source(env, "help from")
+  let assert True = string.contains(help_out, "jwt")
+  Nil
+}
+
 pub fn eval_to_json_pretty_test() {
   let env = env.new()
   // `to` command + `json` subcommand — pretty by default
@@ -486,6 +567,123 @@ pub fn eval_ps_test() {
   let assert True = string.contains(help_out, "--long")
   Nil
 }
+
+pub fn eval_whyport_test() {
+  let env = env.new()
+  // Default: short listener columns only (no command / remote spam).
+  let assert eval.Continue(_, Table(cols, _)) =
+    eval.eval_source(env, "whyport 1")
+  let assert ["protocol", "local_address", "local_port", "pid", "name"] = cols
+
+  // --all adds peer/state; --long adds command (and more).
+  let assert eval.Continue(_, Table(all_cols, _)) =
+    eval.eval_source(env, "whyport --all 1")
+  let assert True = list.contains(all_cols, "state")
+  let assert True = list.contains(all_cols, "remote_port")
+  let assert False = list.contains(all_cols, "command")
+
+  let assert eval.Continue(_, Table(long_cols, _)) =
+    eval.eval_source(env, "whyport --long 1")
+  let assert True = list.contains(long_cols, "command")
+  let assert True = list.contains(long_cols, "family")
+  let assert False = list.contains(long_cols, "state")
+
+  // Port with nothing listening: empty table with schema.
+  let assert eval.Continue(_, Table(_, unused_rows)) =
+    eval.eval_source(env, "whyport 1")
+  let assert [] = unused_rows
+
+  // epmd listens on 4369 when present — default is listeners only.
+  let assert eval.Continue(_, Table(_, epmd_rows)) =
+    eval.eval_source(env, "whyport 4369")
+  case epmd_rows {
+    [] -> Nil
+    _ -> {
+      // Every default row should be a listener (local_port 4369).
+      let assert eval.Continue(_, Int(n)) =
+        eval.eval_source(env, "whyport 4369 | length")
+      let assert True = n >= 1
+      // --all should not be smaller than listeners.
+      let assert eval.Continue(_, Int(all_n)) =
+        eval.eval_source(env, "whyport --all 4369 | length")
+      let assert True = all_n >= n
+      Nil
+    }
+  }
+
+  // Leading colon + pipeline + flag that steals the port value
+  let assert eval.Continue(_, Table(_, _)) =
+    eval.eval_source(env, "whyport :22")
+  let assert eval.Continue(_, Table(_, _)) =
+    eval.eval_source(env, "echo 22 | whyport")
+  let assert eval.Continue(_, Table(_, _)) =
+    eval.eval_source(env, "whyport --all 22")
+
+  // Errors
+  let assert eval.Continue(_, value.Fail(missing)) =
+    eval.eval_source(env, "whyport")
+  let assert True = string.contains(missing, "port")
+  let assert eval.Continue(_, value.Fail(bad)) =
+    eval.eval_source(env, "whyport notaport")
+  let assert True = string.contains(bad, "invalid") || string.contains(bad, "port")
+  let assert eval.Continue(_, value.Fail(range)) =
+    eval.eval_source(env, "whyport 99999")
+  let assert True = string.contains(range, "range")
+
+  let assert eval.Continue(_, String("builtin: whyport")) =
+    eval.eval_source(env, "which whyport")
+  let assert eval.Continue(_, String(help_out)) =
+    eval.eval_source(env, "help whyport")
+  let assert True = string.contains(help_out, "--all")
+  let assert True = string.contains(help_out, "--long")
+  Nil
+}
+
+pub fn eval_now_test() {
+  let env = env.new()
+  // Data is Unix epoch seconds (same as ls modified); near wall clock.
+  let assert eval.Continue(_, Int(secs)) = eval.eval_source(env, "now")
+  let wall = sys.unix_now()
+  let assert True = secs > 1_700_000_000
+  let assert True = secs <= wall + 2 && secs >= wall - 5
+
+  // typeof is int
+  let assert eval.Continue(_, String("int")) =
+    eval.eval_source(env, "now | typeof")
+
+  // Display formats bare epoch ints like ls modified (local 12-hour).
+  let text = display.render_with(False, Int(secs))
+  let assert False = string.contains(text, int.to_string(secs))
+  let assert True = string.contains(text, ":")
+  let assert True =
+    string.contains(text, " AM") || string.contains(text, " PM")
+
+  // Small ints still print as numbers
+  let assert True = string.contains(display.render_with(False, Int(42)), "42")
+
+  let assert eval.Continue(_, String("builtin: now")) =
+    eval.eval_source(env, "which now")
+  let assert eval.Continue(_, String(help_out)) =
+    eval.eval_source(env, "help now")
+  let assert True = string.contains(help_out, "epoch")
+  Nil
+}
+
+pub fn eval_input_help_test() {
+  let env = env.new()
+  let assert eval.Continue(_, String("builtin: input")) =
+    eval.eval_source(env, "which input")
+  let assert eval.Continue(_, String(help_out)) =
+    eval.eval_source(env, "help input")
+  let assert True = string.contains(help_out, "Ctrl+D")
+  let assert True = string.contains(help_out, "from json")
+  // Too many args without reading stdin
+  let assert eval.Continue(_, value.Fail(msg)) =
+    eval.eval_source(env, "input too many args")
+  let assert True = string.contains(msg, "prompt")
+  Nil
+}
+
 
 pub fn http_get_live_test() {
   // Live request against postman-echo (JSON). Skip gracefully if offline.

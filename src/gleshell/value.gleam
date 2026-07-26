@@ -135,6 +135,139 @@ pub fn get_field(record: Value, name: String) -> Result(Value, String) {
   }
 }
 
+/// Split a dotted cell path (`"foo.bar"` → `["foo", "bar"]`).
+/// Empty segments (e.g. `"a..b"`) are rejected.
+pub fn parse_cell_path(path: String) -> Result(List(String), String) {
+  case path {
+    "" -> Error("empty path")
+    _ -> {
+      let parts = string.split(path, ".")
+      case list.any(parts, fn(p) { p == "" }) {
+        True -> Error("invalid path '" <> path <> "' (empty segment)")
+        False -> Ok(parts)
+      }
+    }
+  }
+}
+
+/// Follow a Nushell-style cell path through records, lists, and tables.
+/// Dots nest: `{a: {b: 1}} | get a.b` → `1`.
+/// When a list/table is encountered mid-path, the rest of the path is applied
+/// to each item (missing fields are skipped, matching plain `get` on lists).
+pub fn get_path(value: Value, path: List(String)) -> Result(Value, String) {
+  case path {
+    [] -> Ok(value)
+    [key, ..rest] ->
+      case get_one(value, key) {
+        Error(e) -> Error(e)
+        Ok(next) ->
+          case rest {
+            [] -> Ok(next)
+            _ ->
+              case next {
+                List(items) ->
+                  Ok(
+                    List(
+                      list.filter_map(items, fn(item) {
+                        case get_path(item, rest) {
+                          Ok(v) -> Ok(v)
+                          Error(_) -> Error(Nil)
+                        }
+                      }),
+                    ),
+                  )
+                Table(_, _) ->
+                  case table_to_records(next) {
+                    Error(e) -> Error(e)
+                    Ok(rows) ->
+                      Ok(
+                        List(
+                          list.filter_map(rows, fn(row) {
+                            case get_path(row, rest) {
+                              Ok(v) -> Ok(v)
+                              Error(_) -> Error(Nil)
+                            }
+                          }),
+                        ),
+                      )
+                  }
+                _ -> get_path(next, rest)
+              }
+          }
+      }
+  }
+}
+
+/// One path segment: field on a record, column on a table, or map over a list.
+fn get_one(value: Value, key: String) -> Result(Value, String) {
+  case value {
+    Record(_) -> get_field(value, key)
+    Table(cols, rows) ->
+      case list_index_of(cols, key) {
+        Ok(idx) -> {
+          let col_vals =
+            list.map(rows, fn(row) {
+              case list_at(row, idx) {
+                Ok(v) -> v
+                Error(Nil) -> Nothing
+              }
+            })
+          Ok(List(col_vals))
+        }
+        Error(Nil) -> Error("no column '" <> key <> "'")
+      }
+    List(items) ->
+      Ok(
+        List(
+          list.filter_map(items, fn(item) {
+            case get_field(item, key) {
+              Ok(v) -> Ok(v)
+              Error(_) -> Error(Nil)
+            }
+          }),
+        ),
+      )
+    other -> Error("cannot get '" <> key <> "' from " <> type_name(other))
+  }
+}
+
+fn list_index_of(items: List(String), target: String) -> Result(Int, Nil) {
+  list_index_of_loop(items, target, 0)
+}
+
+fn list_index_of_loop(
+  items: List(String),
+  target: String,
+  i: Int,
+) -> Result(Int, Nil) {
+  case items {
+    [] -> Error(Nil)
+    [x, ..rest] ->
+      case x == target {
+        True -> Ok(i)
+        False -> list_index_of_loop(rest, target, i + 1)
+      }
+  }
+}
+
+fn list_at(items: List(Value), index: Int) -> Result(Value, Nil) {
+  case index < 0 {
+    True -> Error(Nil)
+    False -> list_at_loop(items, index)
+  }
+}
+
+fn list_at_loop(items: List(Value), index: Int) -> Result(Value, Nil) {
+  case items {
+    [] -> Error(Nil)
+    [x, ..rest] ->
+      case index {
+        0 -> Ok(x)
+        _ -> list_at_loop(rest, index - 1)
+      }
+  }
+}
+
 pub fn record_from_pairs(pairs: List(#(String, Value))) -> Value {
   Record(pairs)
 }

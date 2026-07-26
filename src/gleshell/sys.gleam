@@ -3,6 +3,12 @@
 @external(erlang, "gleshell_ffi", "get_line")
 pub fn get_line(prompt: String) -> Result(String, String)
 
+/// Multi-line user input for the `input` builtin.
+/// Reads until Ctrl+D / EOF (interactive paste) or drains piped stdin.
+/// Optional `prompt` is printed first; use `""` for silent.
+@external(erlang, "gleshell_ffi", "read_user_input")
+pub fn read_user_input(prompt: String) -> Result(String, String)
+
 /// Print a line to stdout. In raw TTY REPL mode, newlines become CRLF so
 /// multi-line values (tables, pretty JSON) do not staircase.
 @external(erlang, "gleshell_ffi", "println")
@@ -129,6 +135,10 @@ pub fn stdout_isatty() -> Bool
 @external(erlang, "gleshell_ffi", "format_unix_local")
 pub fn format_unix_local(seconds: Int) -> String
 
+/// Current Unix epoch seconds (UTC wall clock).
+@external(erlang, "gleshell_ffi", "unix_now")
+pub fn unix_now() -> Int
+
 /// One process row from `list_processes` (Nushell `ps` columns).
 /// Memory fields are bytes; `start_time` is Unix epoch seconds (0 if unknown).
 pub type ProcessInfo {
@@ -157,3 +167,27 @@ pub type ProcessInfo {
 /// Samples CPU over ~100ms like Nushell `ps`.
 @external(erlang, "gleshell_ffi", "list_processes")
 pub fn list_processes() -> List(ProcessInfo)
+
+/// One socket row from `list_port_sockets` (like `lsof -i :<port>`).
+/// `pid`/`fd` are 0 when the owner is unknown; `state` is empty for UDP.
+pub type PortSocket {
+  PortSocket(
+    protocol: String,
+    family: String,
+    local_address: String,
+    local_port: Int,
+    remote_address: String,
+    remote_port: Int,
+    state: String,
+    pid: Int,
+    name: String,
+    command: String,
+    user_id: Int,
+    fd: Int,
+  )
+}
+
+/// Sockets whose local or remote port is `port` (Linux `/proc/net` + fd inodes).
+/// Empty list on unsupported OS or when nothing matches.
+@external(erlang, "gleshell_ffi", "list_port_sockets")
+pub fn list_port_sockets(port: Int) -> List(PortSocket)

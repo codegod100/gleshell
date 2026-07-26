@@ -101,7 +101,18 @@ range 5 | length
 echo {name: "gleshell", cool: true}
 echo "{\"a\": 1}" | from json | get a
 open data.json | get users | first
+echo "{\"user\": {\"name\": \"ada\"}}" | from json | get user.name
 range 3 | to json
+
+# JWT (parse only — does not verify signature)
+echo $token | from jwt | get payload
+echo $token | from jwt | get header.alg
+from jwt eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.…
+
+# paste multi-line text into a pipeline (finish with Ctrl+D)
+input | from json
+input "Paste notes:" | lines | find TODO
+# or pipe data into a one-shot: printf '{"a":1}' | gle -c 'input | from json'
 
 # variables
 let n = range 3 | length
@@ -123,6 +134,14 @@ which -f sh
 ps
 ps | sort-by mem | last 5
 ps --long | where name == beam.smp
+
+# who is bound to a port (listeners by default; --all ≈ lsof -i)
+whyport 22
+whyport 4004
+whyport --all 4004
+
+# current time (Unix epoch seconds; prints like ls modified)
+now
 ```
 
 ## Language sketch
@@ -149,7 +168,9 @@ Filesystem: `ls`, `cd`, `pwd`, `cat` (MIME/extension detect + syntax color on TT
 
 Table/list: `where`/`filter`, `find`, `select`, `get`, `first`, `last`, `take`, `skip`, `sort-by`, `reverse`, `length`, `columns`, `table`, `flatten`, `uniq`, `wrap`, `unwrap`, `keys`, `values`
 
-Data: `echo`, `range`, `lines`, `to`/`from` (subcommand `json`), `type`, `describe`, `env`, `sys`, `which`, `help`, `about`, `exit`
+Data: `echo`, `range`, `lines`, `input` (multi-line paste / stdin until Ctrl+D),
+`to`/`from` (subcommands `json`, `jwt`), `type`, `describe`, `env`, `sys`, `ps`,
+`whyport`, `now`, `which`, `help`, `about`, `exit`
 
 HTTP: `http get|post|put|delete|patch|head` — fetch/send with structured JSON bodies
 and responses (`http get https://example.com`, `http post URL {a: 1}`, `--full`,

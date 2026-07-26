@@ -77,6 +77,7 @@ pub fn registry() -> dict.Dict(String, Builtin) {
     #("quit", cmd_exit),
     #("ignore", cmd_ignore),
     #("identity", cmd_identity),
+    #("input", cmd_input),
     #("range", cmd_range),
     #("append", cmd_append),
     #("prepend", cmd_prepend),
@@ -89,6 +90,8 @@ pub fn registry() -> dict.Dict(String, Builtin) {
     #("keys", cmd_keys),
     #("sys", cmd_sys),
     #("ps", cmd_ps),
+    #("whyport", cmd_whyport),
+    #("now", cmd_now),
     #("about", cmd_about),
     #("less", cmd_less),
   ])
@@ -197,10 +200,18 @@ fn help_for(name: String) -> Result(String, Nil) {
           "",
           "Subcommands:",
           "  json — parse a JSON string (pipeline input or a string argument)",
+          "  jwt  — decode a JWT (JWS compact) into header/payload/signature",
+          "",
+          "JWT notes: does not verify the signature; only base64url-decodes and",
+          "parses the JSON header and claims. Optional \"Bearer \" prefix is",
+          "stripped. Signature is returned as the original base64url segment.",
           "",
           "Examples:",
           "  open data.json | from json",
           "  echo '{\"a\": 1}' | from json | get a",
+          "  echo $token | from jwt | get payload",
+          "  echo $token | from jwt | get header.alg",
+          "  from jwt eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.…",
         ],
         "\n",
       ))
@@ -298,6 +309,75 @@ fn help_for(name: String) -> Result(String, Nil) {
         ],
         "\n",
       ))
+    "whyport" ->
+      Ok(string.join(
+        [
+          "whyport [-a|--all] [-l|--long] <port> — who is bound to a port",
+          "",
+          "Answers “why is this port taken?” Default: local listeners only",
+          "(TCP LISTEN + UDP binds), short columns — not every ESTABLISHED",
+          "client or TIME_WAIT row, and not full command lines.",
+          "",
+          "Flags:",
+          "  -a, --all    all sockets touching the port (local or remote),",
+          "               like `lsof -i :<port>` (adds state + remote cols)",
+          "  -l, --long   extra columns: family, command, user_id, fd",
+          "",
+          "Default columns: protocol, local_address, local_port, pid, name",
+          "With --all:     + remote_address, remote_port, state",
+          "With --long:    + family, command, user_id, fd",
+          "",
+          "Accepts the port as an argument or pipeline input. Leading `:` is",
+          "optional (`whyport 8080` and `whyport :8080` are the same).",
+          "",
+          "Examples:",
+          "  whyport 22",
+          "  whyport 4004",
+          "  whyport --all 4004",
+          "  whyport -al 8080",
+          "  echo 3000 | whyport",
+        ],
+        "\n",
+      ))
+    "now" ->
+      Ok(string.join(
+        [
+          "now — current Unix time (epoch seconds)",
+          "",
+          "Inspired by Nushell `date now`. Returns an int of UTC epoch seconds,",
+          "the same representation as `ls` modified / `ps` start_time. Display",
+          "formats it as a local 12-hour datetime (e.g. Jul 26 2026 3:17:35 AM).",
+          "",
+          "Examples:",
+          "  now",
+          "  let t = now",
+          "  ls | where modified > 1700000000",
+        ],
+        "\n",
+      ))
+    "input" ->
+      Ok(string.join(
+        [
+          "input [prompt] — read multi-line text from the terminal (or stdin)",
+          "",
+          "Type or paste freely; finish with Ctrl+D (EOF). The collected text is",
+          "a string you can pipe into anything — `from json`, `lines`, `save`, …",
+          "",
+          "Interactive: after Enter on the command line, paste content, then Ctrl+D.",
+          "Piped: `printf '…' | gle -c 'input | from json'` drains stdin.",
+          "",
+          "Optional prompt string is printed before reading (on its own line).",
+          "Ctrl+C cancels.",
+          "",
+          "Examples:",
+          "  input | from json",
+          "  input | lines | find TODO",
+          "  input \"Paste JWT:\" | from jwt | get payload",
+          "  input | save notes.txt",
+          "  let body = input",
+        ],
+        "\n",
+      ))
     _ -> help_line(name)
   }
 }
@@ -329,7 +409,7 @@ fn help_text() -> dict.Dict(String, String) {
       "find [-i] [-v] [--regex pat] <term>… — search list/table/string input for terms",
     ),
     #("select", "select <col>… — keep only named columns"),
-    #("get", "get <field|index> — get a field or list index"),
+    #("get", "get <field|path|index> — get a field, dotted path (a.b), or list index"),
     #("first", "first [n] — first row/item (default 1)"),
     #("last", "last [n] — last row/item"),
     #("take", "take <n> — take first n items"),
@@ -348,7 +428,7 @@ fn help_text() -> dict.Dict(String, String) {
     ),
     #(
       "from",
-      "from <format> — parse structured input (subcommands: json)",
+      "from <format> — parse structured input (subcommands: json, jwt)",
     ),
     #(
       "http",
@@ -373,6 +453,10 @@ fn help_text() -> dict.Dict(String, String) {
     #("quit", "quit [code] — alias for exit"),
     #("ignore", "ignore — discard pipeline input; emit nothing"),
     #("identity", "identity — pass pipeline input through unchanged"),
+    #(
+      "input",
+      "input [prompt] — read multi-line text until Ctrl+D (pipe into next stage)",
+    ),
     #("range", "range <end> | range <start> <end> — integer range list"),
     #("append", "append <values>… — append values to list input"),
     #("prepend", "prepend <values>… — prepend values to list input"),
@@ -391,6 +475,11 @@ fn help_text() -> dict.Dict(String, String) {
       "ps",
       "ps [-l|--long] — system processes table (pid, name, cpu, mem, …)",
     ),
+    #(
+      "whyport",
+      "whyport [-a|--all] [-l|--long] <port> — who is bound to a TCP/UDP port",
+    ),
+    #("now", "now — current time as Unix epoch seconds (prints as local datetime)"),
     #("about", "about — authorship, ATProto handle, and a little sparkle"),
     #(
       "less",
@@ -1065,39 +1154,15 @@ fn cmd_get(
       }
     }
     [String(key)] ->
-      case input {
-        Record(_) ->
-          case value.get_field(input, key) {
+      case value.parse_cell_path(key) {
+        Error(e) -> err(env, "get: " <> e)
+        Ok(path) ->
+          case value.get_path(input, path) {
             Ok(v) -> ok(env, v)
             Error(e) -> err(env, "get: " <> e)
           }
-        Table(cols, rows) ->
-          case list_index_of(cols, key) {
-            Ok(idx) -> {
-              let col_vals =
-                list.map(rows, fn(row) {
-                  case list_at(row, idx) {
-                    Ok(v) -> v
-                    Error(Nil) -> Nothing
-                  }
-                })
-              ok(env, List(col_vals))
-            }
-            Error(Nil) -> err(env, "get: no column '" <> key <> "'")
-          }
-        List(items) -> {
-          let got =
-            list.filter_map(items, fn(item) {
-              case value.get_field(item, key) {
-                Ok(v) -> Ok(v)
-                Error(_) -> Error(Nil)
-              }
-            })
-          ok(env, List(got))
-        }
-        _ -> err(env, "get: unsupported input type " <> value.type_name(input))
       }
-    _ -> err(env, "get: expected field name or index")
+    _ -> err(env, "get: expected field name, dotted path, or index")
   }
 }
 
@@ -1345,8 +1410,12 @@ fn cmd_from(
 ) -> BuiltinResult {
   case args {
     [String("json"), ..rest] -> cmd_from_json(env, input, rest, flags)
+    [String("jwt"), ..rest] -> cmd_from_jwt(env, input, rest, flags)
     [] ->
-      err(env, "from: expected subcommand (try `from json`; see `help from`)")
+      err(
+        env,
+        "from: expected subcommand (try `from json` or `from jwt`; see `help from`)",
+      )
     [String(sub), ..] -> err(env, "from: unknown subcommand: " <> sub)
     _ -> err(env, "from: expected subcommand name")
   }
@@ -1402,6 +1471,91 @@ fn cmd_from_json(
       case parse_json_value(s) {
         Ok(v) -> ok(env, v)
         Error(msg) -> err(env, "from: json: " <> msg)
+      }
+  }
+}
+
+/// Decode a JWT (JWS compact serialization) into a structured record.
+/// Does **not** verify the cryptographic signature — parse-only, like `jwt decode`.
+fn cmd_from_jwt(
+  env: Env,
+  input: Value,
+  args: List(Value),
+  _flags: dict.Dict(String, Value),
+) -> BuiltinResult {
+  let source = case args {
+    [String(s)] -> s
+    [other] -> value.as_string(other)
+    [] ->
+      case input {
+        String(s) -> s
+        Nothing -> ""
+        other -> value.as_string(other)
+      }
+    _ -> ""
+  }
+  case string.trim(source) {
+    "" -> err(env, "from: jwt: empty input")
+    s ->
+      case parse_jwt(s) {
+        Ok(v) -> ok(env, v)
+        Error(msg) -> err(env, "from: jwt: " <> msg)
+      }
+  }
+}
+
+/// Parse a compact JWT into `{ header, payload, signature }`.
+/// Signature is the original base64url segment (not decoded to binary).
+fn parse_jwt(token: String) -> Result(Value, String) {
+  let cleaned = strip_bearer_prefix(string.trim(token))
+  case string.split(cleaned, ".") {
+    [header_b64, payload_b64, signature_b64] -> {
+      case decode_jwt_json_part(header_b64, "header") {
+        Error(e) -> Error(e)
+        Ok(header) ->
+          case decode_jwt_json_part(payload_b64, "payload") {
+            Error(e) -> Error(e)
+            Ok(payload) ->
+              Ok(
+                Record([
+                  #("header", header),
+                  #("payload", payload),
+                  #("signature", String(signature_b64)),
+                ]),
+              )
+          }
+      }
+    }
+    parts ->
+      Error(
+        "expected 3 dot-separated segments (header.payload.signature), got "
+        <> int.to_string(list.length(parts)),
+      )
+  }
+}
+
+fn strip_bearer_prefix(s: String) -> String {
+  case string.starts_with(string.lowercase(s), "bearer ") {
+    True -> string.trim(string.drop_start(s, 7))
+    False -> s
+  }
+}
+
+fn decode_jwt_json_part(segment: String, part_name: String) -> Result(Value, String) {
+  case segment {
+    "" -> Error(part_name <> ": empty segment")
+    b64 ->
+      case bit_array.base64_url_decode(b64) {
+        Error(Nil) -> Error(part_name <> ": invalid base64url")
+        Ok(bits) ->
+          case bit_array.to_string(bits) {
+            Error(Nil) -> Error(part_name <> ": not valid UTF-8 after decode")
+            Ok(json_text) ->
+              case parse_json_value(json_text) {
+                Ok(v) -> Ok(v)
+                Error(msg) -> Error(part_name <> ": JSON: " <> msg)
+              }
+          }
       }
   }
 }
@@ -2184,6 +2338,34 @@ fn cmd_identity(
   ok(env, input)
 }
 
+// --- input (multi-line paste / stdin → string for the pipeline) ---
+
+fn cmd_input(
+  env: Env,
+  _input: Value,
+  args: List(Value),
+  _flags: dict.Dict(String, Value),
+) -> BuiltinResult {
+  let prompt = case args {
+    [] -> ""
+    [String(s)] -> s
+    [other] -> value.as_string(other)
+    _ -> ""
+  }
+  case args {
+    [_, _, ..] ->
+      err(env, "input: expected at most one prompt string (see `help input`)")
+    _ ->
+      case sys.read_user_input(prompt) {
+        Ok(text) -> ok(env, String(text))
+        Error("interrupted") ->
+          err(env, "input: interrupted")
+        Error("eof") -> ok(env, String(""))
+        Error(msg) -> err(env, "input: " <> msg)
+      }
+  }
+}
+
 fn cmd_range(
   env: Env,
   _input: Value,
@@ -2355,6 +2537,19 @@ fn cmd_sys(
   )
 }
 
+// --- now (Nushell-style current datetime) ---
+
+fn cmd_now(
+  env: Env,
+  _input: Value,
+  _args: List(Value),
+  _flags: dict.Dict(String, Value),
+) -> BuiltinResult {
+  // Same representation as `ls` modified / `ps` start_time: raw epoch seconds.
+  // Display formats bare epoch ints as local datetimes (see display.render).
+  ok(env, Int(sys.unix_now()))
+}
+
 // --- ps (Nushell-style process table) ---
 
 fn cmd_ps(
@@ -2367,6 +2562,147 @@ fn cmd_ps(
   let records =
     list.map(sys.list_processes(), fn(p) { process_to_record(p, long) })
   ok(env, value.table_from_records(records))
+}
+
+// --- whyport (who owns a port; --all ≈ `lsof -i :<port>`) ---
+
+fn cmd_whyport(
+  env: Env,
+  input: Value,
+  args: List(Value),
+  flags: dict.Dict(String, Value),
+) -> BuiltinResult {
+  let #(all, stolen_a) = find_bool_flag(flags, ["a", "all"])
+  let #(long, stolen_l) = find_bool_flag(flags, ["l", "long"])
+  // Bool flags may steal the port (`whyport --all 4004` → flag value "4004").
+  let port_args = list.flatten([args, stolen_a, stolen_l])
+  case resolve_port_number(input, port_args) {
+    Error(msg) -> err(env, msg)
+    Ok(port) -> {
+      let sockets =
+        sys.list_port_sockets(port)
+        |> list.filter(fn(s) { whyport_keep_socket(s, port, all) })
+      let records =
+        list.map(sockets, fn(s) { port_socket_to_record(s, all, long) })
+      ok(env, whyport_table(records, all, long))
+    }
+  }
+}
+
+/// Default: local listeners only. `--all`: any socket touching the port.
+fn whyport_keep_socket(s: sys.PortSocket, port: Int, all: Bool) -> Bool {
+  case all {
+    True -> True
+    False ->
+      // Bound here: local port matches, and either TCP LISTEN or a UDP bind
+      // (UDP has no LISTEN state; unbound peer means "listening" socket).
+      s.local_port == port
+      && case s.protocol {
+        "tcp" -> s.state == "LISTEN"
+        "udp" -> s.remote_port == 0
+        _ -> s.state == "LISTEN" || s.remote_port == 0
+      }
+  }
+}
+
+fn whyport_columns(all: Bool, long: Bool) -> List(String) {
+  let base = ["protocol", "local_address", "local_port", "pid", "name"]
+  let with_peers = case all {
+    False -> base
+    True ->
+      list.append(base, ["remote_address", "remote_port", "state"])
+  }
+  case long {
+    False -> with_peers
+    True ->
+      list.append(with_peers, ["family", "command", "user_id", "fd"])
+  }
+}
+
+fn whyport_table(records: List(Value), all: Bool, long: Bool) -> Value {
+  case records {
+    [] -> Table(whyport_columns(all, long), [])
+    _ -> value.table_from_records(records)
+  }
+}
+
+/// Port from arg (`whyport 8080`, `whyport :8080`) or pipeline (`echo 8080 | whyport`).
+fn resolve_port_number(
+  input: Value,
+  args: List(Value),
+) -> Result(Int, String) {
+  case args {
+    [raw] -> parse_port_value(raw)
+    [] ->
+      case input {
+        Nothing ->
+          Error(
+            "whyport: expected port number (e.g. `whyport 8080`; see `help whyport`)",
+          )
+        other -> parse_port_value(other)
+      }
+    _ -> Error("whyport: expected a single port number")
+  }
+}
+
+fn parse_port_value(v: Value) -> Result(Int, String) {
+  case v {
+    Int(n) -> validate_port(n)
+    String(s) -> {
+      let cleaned = string.trim(s)
+      let without_colon = case string.starts_with(cleaned, ":") {
+        True -> string.drop_start(cleaned, 1)
+        False -> cleaned
+      }
+      case int.parse(string.trim(without_colon)) {
+        Ok(n) -> validate_port(n)
+        Error(Nil) -> Error("whyport: invalid port: " <> cleaned)
+      }
+    }
+    other ->
+      Error("whyport: expected port number, got " <> value.type_name(other))
+  }
+}
+
+fn validate_port(n: Int) -> Result(Int, String) {
+  case n >= 0 && n <= 65_535 {
+    True -> Ok(n)
+    False ->
+      Error(
+        "whyport: port out of range (0–65535): " <> int.to_string(n),
+      )
+  }
+}
+
+fn port_socket_to_record(s: sys.PortSocket, all: Bool, long: Bool) -> Value {
+  let base = [
+    #("protocol", String(s.protocol)),
+    #("local_address", String(s.local_address)),
+    #("local_port", Int(s.local_port)),
+    #("pid", Int(s.pid)),
+    #("name", String(s.name)),
+  ]
+  let with_peers = case all {
+    False -> base
+    True ->
+      list.append(base, [
+        #("remote_address", String(s.remote_address)),
+        #("remote_port", Int(s.remote_port)),
+        #("state", String(s.state)),
+      ])
+  }
+  case long {
+    False -> Record(with_peers)
+    True ->
+      Record(
+        list.append(with_peers, [
+          #("family", String(s.family)),
+          #("command", String(s.command)),
+          #("user_id", Int(s.user_id)),
+          #("fd", Int(s.fd)),
+        ]),
+      )
+  }
 }
 
 fn process_to_record(p: sys.ProcessInfo, long: Bool) -> Value {
@@ -2507,20 +2843,5 @@ fn list_at(items: List(a), index: Int) -> Result(a, Nil) {
     [x, ..], 0 -> Ok(x)
     [_, ..rest], n if n > 0 -> list_at(rest, n - 1)
     _, _ -> Error(Nil)
-  }
-}
-
-fn list_index_of(items: List(a), target: a) -> Result(Int, Nil) {
-  list_index_of_loop(items, target, 0)
-}
-
-fn list_index_of_loop(items: List(a), target: a, i: Int) -> Result(Int, Nil) {
-  case items {
-    [] -> Error(Nil)
-    [x, ..rest] ->
-      case x == target {
-        True -> Ok(i)
-        False -> list_index_of_loop(rest, target, i + 1)
-      }
   }
 }
